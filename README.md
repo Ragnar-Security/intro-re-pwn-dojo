@@ -2,6 +2,8 @@
 
 This is an optional practice dojo for UMD Cybersecurity Club members. It starts with small C and assembly exercises, then introduces tools for examining programs, simple memory bugs, shellcode, format strings, and common binary defenses.
 
+**Play it on pwn.college:** <https://pwn.college/intro-re-pwn~5933fc84/>
+
 You do not need previous reverse engineering experience. Work through the modules in order. Each challenge includes a short explanation and a hint ladder. Try a challenge before opening its hints, and stop reading when you have enough information to continue.
 
 A **binary** is a compiled program. **Reverse engineering** means learning what a binary does by examining it instead of reading its source code. **Binary exploitation** means using a programming mistake to make a binary behave in an unintended way.

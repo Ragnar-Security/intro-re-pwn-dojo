@@ -1,6 +1,6 @@
 id: intro-re-pwn
 name: Intro to Reverse Engineering & Binary Exploitation
-type: topic
+type: public
 description: |
   Beginner-friendly practice in reading Linux programs and understanding simple
   memory bugs. No prior reverse engineering experience is required.

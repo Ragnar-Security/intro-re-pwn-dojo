@@ -1,0 +1,16 @@
+id: intro-re-pwn
+name: Intro to Reverse Engineering & Binary Exploitation
+type: topic
+description: |
+  Beginner-friendly practice in reading Linux programs and understanding simple
+  memory bugs. No prior reverse engineering experience is required.
+image: mwittner/enpm696-challenge:fall2026.2
+modules:
+  - id: c-warmup
+  - id: assembly
+  - id: tools
+  - id: reversing
+  - id: first-memory-bug
+  - id: shellcode
+  - id: format-strings
+  - id: defenses

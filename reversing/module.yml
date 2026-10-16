@@ -1,0 +1,1057 @@
+name: Reverse Engineering
+description: |
+  Combine static analysis and debugging to understand small programs without
+  seeing their source code.
+
+  New to this? Read the **Start here** lessons below before the first
+  challenge. They walk through a complete example, from a program you know
+  nothing about to the input it wants.
+challenges:
+  - id: stripped
+    name: A Stripped Binary
+  - id: xor-key
+    name: Recover an XOR Key
+  - id: multi-func
+    name: Follow Multiple Functions
+  - id: encoded-string
+    name: Decode a String
+  - id: gdb-runtime
+    name: Observe a Program in GDB
+  - id: simple-crackme
+    name: Simple Crackme
+resources:
+  - name: "Start here: what reverse engineering is"
+    type: markdown
+    content: |
+      ## What this module is about
+
+      **Reverse engineering** (RE) means working out what a program does when you
+      have only the compiled program, not the source code someone wrote it from.
+      Every challenge in this module is a small Linux program that checks
+      something you type: a number, a password, or a table position. You will read
+      its machine code, run it under a debugger, and turn what you learn into the
+      input it accepts. Every later module builds on this: before you can exploit a
+      bug, you have to find it and understand the code around it.
+
+      This module assumes you have done **Assembly Basics** (registers, `mov`,
+      `cmp`, jumps) and **Looking Inside Programs** (`strings`, `objdump`,
+      `ltrace`). If a line like `mov eax,DWORD PTR [rbp-0x4]` means nothing to you
+      yet, go back to those first.
+
+      ## The workflow
+
+      Reverse engineering is a loop of guessing and checking. Most problems go
+      through four steps, often more than once:
+
+      ```
+       1. LOOK            2. STATIC ANALYSIS     3. DYNAMIC ANALYSIS    4. CONFIRM
+       run it once,       read the code          run it under a         compute the
+       file, strings,     without running it:    debugger, stop it,     answer (often
+       ltrace             objdump, Ghidra        inspect and change     in Python) and
+                                                 values: gdb            give it to the
+                                                                        real program
+         |                     |                       |                     |
+         +----> form a guess --+----> test the guess --+----> works? done.   |
+                     ^                                        no? go back ---+
+      ```
+
+      1. **Look.** Spend two minutes on cheap questions. What kind of file is it
+         (`file`)? What text is inside (`strings`)? What does it print when you run
+         it? Which library functions does it call (`ltrace`)? You are collecting
+         clues, not answers.
+      2. **Static analysis** means reading the program without running it. A
+         **disassembler** (`objdump`) shows the machine instructions. A
+         **decompiler** (Ghidra) turns those instructions back into approximate C,
+         which is faster to read but can be wrong in small ways.
+      3. **Dynamic analysis** means running the program and watching it. A
+         **debugger** (`gdb`) can stop the program at any instruction, show you
+         registers and memory at that moment, and change them.
+      4. **Confirm.** Feed your answer to the real program. The program is the
+         judge, not your notes. If it says no, one of your guesses was wrong; go
+         back and find which one.
+
+      ## Tools in this dojo
+
+      | Tool | What it is for | How to start it |
+      |---|---|---|
+      | `file`, `strings`, `readelf` | first look at a program | `readelf -h /challenge/NAME` |
+      | `objdump` | disassemble | `objdump -d -M intel /challenge/NAME \| more` |
+      | `ltrace` | list library calls as they happen | `ltrace /challenge/NAME` |
+      | Ghidra | decompile to C (graphical) | `ghidraRun` from the Desktop workspace |
+      | Ghidra headless | decompile from a terminal | `analyzeHeadless` (lesson "Ghidra and gdb in this dojo") |
+      | radare2 + Ghidra's decompiler | quick decompile in a terminal | `r2 -A -qc 'pdg @ main' /challenge/NAME` |
+      | `gdb` with pwndbg | debugger | `gdb /challenge/NAME` |
+      | `python3` | calculator and small scripts | `python3` |
+
+      Ghidra is installed in `/opt/ghidra`. Its own beginner course and cheat
+      sheet are in `/opt/ghidra/docs/GhidraClass/Beginner/` and
+      `/opt/ghidra/docs/CheatSheet.html`.
+
+      ## A suggested order
+
+      1. **xor-key**: function names are present; one `xor`, one `cmp`.
+      2. **stripped**: the names are gone; find `main` yourself.
+      3. **simple-crackme**: a decode loop with a one-byte key.
+      4. **encoded-string**: a decode loop where each byte gets a different key.
+      5. **multi-func**: a table of function addresses.
+      6. **gdb-runtime**: the answer exists only while the program runs.
+
+      Read the next lessons in order. "Worked example" puts everything together
+      on a toy program that is not one of the challenges.
+
+  - name: "Concepts: finding main in a stripped program"
+    type: markdown
+    content: |
+      ## Symbols, and what stripping removes
+
+      When `gcc` builds a program it keeps a **symbol table**: a list of names
+      (`main`, `check`, global variable names) and the address of each. Tools use
+      it to label the disassembly with `<main>:` and to let you type
+      `break main` in gdb. The program does not need these names to run.
+
+      `strip` deletes the symbol table. The result is a **stripped** binary. Every
+      instruction is still there; only the labels are gone. `file` tells you:
+
+      ```
+      toylock-stripped: ELF 64-bit LSB executable, x86-64, ... stripped
+      ```
+
+      Names of **library functions** such as `printf` and `memcmp` survive,
+      because the program needs them to find those functions in the C library
+      when it starts.
+
+      ## How a C program starts
+
+      `main` is not the first code that runs. The **entry point** is the address
+      where Linux starts executing the program. It is written in the file's
+      header, and it points at a small piece of startup code called `_start`:
+
+      ```
+       Linux loads the program
+               |
+               v
+       _start                    at the entry point address (readelf -h)
+               |  puts the ADDRESS OF main into rdi, the first-argument register
+               v
+       __libc_start_main(main, ...)      inside the C library
+               |  sets up the library, then calls the function it was given
+               v
+       main(argc, argv, envp)    the code the programmer wrote
+               |
+               v
+       exit(whatever main returned)
+      ```
+
+      On x86-64 Linux the first six arguments of a function call travel in the
+      registers `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, in that order. So the
+      address of `main` is whatever `_start` puts into `rdi` right before it calls
+      `__libc_start_main`.
+
+      ## The recipe
+
+      1. `readelf -h PROGRAM` and read the line `Entry point address`.
+      2. `objdump -d -M intel PROGRAM | more`, then search for that address
+         (type `/` and the address without `0x`, then Enter). `more` shows one
+         screen at a time: Space for the next screen, `/` to search, `q` to quit.
+      3. A few lines later you will see `mov rdi,ADDRESS`, then a `call`, then
+         `hlt`. That `ADDRESS` is `main`.
+
+      The worked example shows this on a real program. Two warnings:
+
+      - **objdump invents labels in stripped programs.** It names every address
+        after the nearest symbol it still knows, so you will see nonsense such as
+        `call 40124b <fgets@plt+0x16b>`. That call does not go anywhere near
+        `fgets`. Ignore the text in `< >` and use the number.
+      - All programs in this module are built as **non-PIE**, so they load at the
+        same fixed addresses every run and the address in `mov rdi,ADDRESS` is the
+        real one. A **PIE** (position-independent executable) is loaded at a
+        random address each run; its `_start` uses `lea rdi,[rip+0x...]` instead,
+        and the comment objdump prints after it holds the offset of `main`.
+
+      Ghidra and radare2 apply this same recipe for you. In a stripped program
+      Ghidra shows the startup code as `entry`, and the decompiled `entry` reads
+      `__libc_start_main(FUN_004012ac, ...)`: the first argument is `main`.
+      Knowing the recipe still matters, because it tells you what to check when a
+      tool guesses wrong.
+
+  - name: "Concepts: encode loops, XOR, and lookup tables"
+    type: markdown
+    content: |
+      ## Why programs hide strings
+
+      If a password sits in the program as plain text, `strings` shows it in one
+      second. So simple programs **encode** it: they store a scrambled version and
+      use a small, reversible rule to turn your input into the scrambled form, or
+      the scrambled form back into text (**decode**). This is not real encryption.
+      Anyone who reads the rule can undo it, and reading the rule is your job.
+
+      ## XOR
+
+      **XOR** (exclusive OR, `^` in C and Python, `xor` in assembly) compares two
+      numbers bit by bit. Each result bit is 1 when the two input bits differ:
+
+      ```
+        bit A  bit B  A^B           0x61  = 0110 0001   the letter 'a'
+          0      0     0          ^ 0x13  = 0001 0011   a key byte
+          0      1     1          = 0x72  = 0111 0010   scrambled
+          1      0     1          ^ 0x13  = 0001 0011   the same key again
+          1      1     0          = 0x61  = 0110 0001   back to 'a'
+      ```
+
+      The right-hand side shows the property that makes XOR popular: applying the
+      same key twice gives back what you started with. If `scrambled = plain ^ key`,
+      then `plain = scrambled ^ key`. You undo XOR with XOR.
+
+      ## What a loop looks like at `-O0`
+
+      The programs here are compiled without optimization (`-O0`), so every
+      `for` loop has the same shape. The loop counter lives on the stack:
+
+      ```
+             mov  DWORD PTR [rbp-0x4],0x0    ; i = 0
+             jmp  CHECK                      ; test the condition first
+      BODY:  ...                             ; one round of work, uses i
+             add  DWORD PTR [rbp-0x4],0x1    ; i = i + 1
+      CHECK: mov  eax,DWORD PTR [rbp-0x4]
+             cmp  eax,LIMIT
+             jl   BODY                       ; go back while i < LIMIT
+      ```
+
+      To find a loop, look for a jump that goes **backwards** (to a smaller
+      address). Then count the rounds carefully: `jl` (jump if less) means
+      `i < LIMIT`, which is `LIMIT` rounds. `jle` (jump if less or equal) means
+      `i <= LIMIT`, which is `LIMIT + 1` rounds.
+
+      An **encode loop** body has three parts: read one byte (`movzx eax,BYTE PTR
+      [...]`), mix it with something (`xor`, `add`, `sub`, `imul`), and write one
+      byte (`mov BYTE PTR [...],dl`). Find those three and you have the rule.
+
+      ## Lookup tables
+
+      A **lookup table** is an array of constants stored in the program, read at a
+      position (an **index**) the code computes. The bytes sit next to each other
+      in memory:
+
+      ```
+       address   0x402008  0x402009  0x40200a  0x40200b
+       value       0x13      0x37      0x42      0x7f
+       index       [0]       [1]       [2]       [3]
+      ```
+
+      In assembly, reading `table[index]` looks like this:
+
+      ```
+      movzx  eax,BYTE PTR [rax+0x402008]    ; one byte from (0x402008 + rax)
+      ```
+
+      The constant is the table's address and the register is the index. For
+      bigger entries the index is multiplied by the entry size: `[rax*4+ADDR]` for
+      4-byte numbers, `[rax*8+ADDR]` for 8-byte values. An 8-byte value is often an
+      **address of a function**. A table of function addresses followed by a
+      `call rax` (an **indirect call**, where the target comes from a register) is
+      how a program picks which function to run based on a number.
+
+      **`i % 4` in disassembly.** A key that repeats every 4 bytes uses
+      `table[i % 4]`. gcc writes `%` as a strange-looking sequence, because it has
+      to handle negative numbers too:
+
+      ```
+      sar    eax,0x1f
+      shr    eax,0x1e
+      add    edx,eax
+      and    edx,0x3        ; <- the 3 means "% 4" (for i >= 0, i % 4 == i & 3)
+      sub    edx,eax
+      ```
+
+      When you see `and REG,0x3` (or `0x7`, `0xf`) next to shifts, think "remainder
+      after dividing by 4 (or 8, or 16)".
+
+      ## Undoing an encode rule
+
+      Undo the steps **in reverse order**, each with its opposite:
+
+      | the program did | you do |
+      |---|---|
+      | `x ^ k` | `x ^ k` (XOR undoes itself) |
+      | `x + k` | `x - k` |
+      | `x - k` | `x + k` |
+      | the last step | first |
+
+      Machine registers wrap around: a byte that goes past `0xff` starts again at
+      `0x00`. Python numbers never wrap, so after each `+` or `-` add `& 0xff` to
+      keep only the lowest 8 bits, the same as the program does.
+
+      Notice which direction the program works in. If it **decodes** stored bytes
+      and compares the result with your input, run the decode yourself (or read
+      the decoded text in gdb). If it **encodes your input** and compares that with
+      stored bytes, you must invert the rule. The worked example is the second kind.
+
+  - name: "Ghidra and gdb in this dojo"
+    type: markdown
+    content: |
+      ## Ghidra, the graphical way
+
+      Open the **Desktop** workspace in pwn.college, open a terminal there, and run
+      `ghidraRun`. Then:
+
+      1. Accept the license, close the tips window.
+      2. **File → New Project → Non-Shared Project**, pick a folder in your home
+         directory and a name, **Finish**.
+      3. **File → Import File**, choose `/challenge/NAME`, **OK**, **OK**.
+      4. Double-click the imported program. Answer **Yes** to "Analyze?", then
+         click **Analyze**.
+      5. On the left, **Symbol Tree → Functions** lists every function. Click one.
+         The middle panel (**Listing**) shows its assembly; the right panel
+         (**Decompile**) shows Ghidra's C. Clicking a line in one panel highlights
+         the matching lines in the other.
+
+      Two keys you will use: **L** renames whatever is under the cursor (rename
+      `FUN_0040124b` to `check` once you know what it does), and **G** jumps to an
+      address you type.
+
+      ## Ghidra without the graphics
+
+      `analyzeHeadless` runs the same analysis from a terminal. It needs a small
+      script to print the decompiled C. Save this as
+      `~/ghidra_scripts/Decompile.java` (for example with `nano`):
+
+      ```java
+      // Write Ghidra's decompiled C to ~/<program>.decomp.c
+      // Name functions after the script to pick them; name none to get every function.
+      import ghidra.app.decompiler.DecompInterface;
+      import ghidra.app.script.GhidraScript;
+      import ghidra.program.model.listing.Function;
+      import java.io.File;
+      import java.io.PrintWriter;
+      import java.util.Arrays;
+      import java.util.List;
+
+      public class Decompile extends GhidraScript {
+          @Override
+          public void run() throws Exception {
+              List<String> wanted = Arrays.asList(getScriptArgs());
+              File outFile = new File(System.getProperty("user.home"),
+                                      currentProgram.getName() + ".decomp.c");
+              DecompInterface decompiler = new DecompInterface();
+              decompiler.openProgram(currentProgram);
+              try (PrintWriter out = new PrintWriter(outFile)) {
+                  for (Function f : currentProgram.getFunctionManager().getFunctions(true)) {
+                      if (f.isThunk() || f.isExternal()) continue;
+                      if (!wanted.isEmpty() && !wanted.contains(f.getName())) continue;
+                      out.println(decompiler.decompileFunction(f, 60, monitor)
+                                            .getDecompiledFunction().getC());
+                  }
+              }
+              println("wrote " + outFile);
+          }
+      }
+      ```
+
+      Then run it (about 10 seconds for a small program):
+
+      ```bash
+      mkdir -p ~/ghidra-projects
+      analyzeHeadless ~/ghidra-projects scratch -import /challenge/NAME -deleteProject \
+          -scriptPath ~/ghidra_scripts -postScript Decompile.java > ~/ghidra.log 2>&1
+      more ~/NAME.decomp.c
+      ```
+
+      `-deleteProject` throws the project away afterwards, so you can run the same
+      command again. If `NAME.decomp.c` is missing, read `~/ghidra.log`.
+
+      ## The fastest way: radare2 with Ghidra's decompiler
+
+      radare2 (`r2`) is another reverse-engineering tool. The copy here includes
+      Ghidra's decompiler, behind the command `pdg`:
+
+      ```bash
+      r2 -A -qc 'pdg @ main' /challenge/NAME 2>/dev/null
+      r2 -A -qc 'afl' /challenge/NAME 2>/dev/null       # list the functions it found
+      ```
+
+      `-A` analyzes the program, `-q` quits afterwards, `-c` runs the command in
+      quotes, and `2>/dev/null` hides the progress messages. radare2 finds `main`
+      even in a stripped program; other unnamed functions appear as
+      `fcn.ADDRESS`. Its names for variables differ from Ghidra's own (`arg1`
+      instead of `param_1`), but the logic is the same.
+
+      ## gdb, the commands you need
+
+      | Command | What it does |
+      |---|---|
+      | `gdb /challenge/NAME` | load the program (it does not start yet) |
+      | `break *0x401228` | stop when execution reaches that address. The `*` means "address"; without it gdb looks for a function name, and a stripped program has none. |
+      | `run` | start the program. `run < /tmp/in.txt` feeds a file as its input. |
+      | `continue` (`c`) | keep running until the next breakpoint |
+      | `ni` / `si` | run one instruction; `si` follows into calls, `ni` steps over them |
+      | `x/1i $pc` | show the instruction about to run (`$pc` is the current address) |
+      | `info registers` | every register |
+      | `p/x $eax` | print one register in hex (`p $eax` for decimal) |
+      | `x/8bx ADDRESS` | show 8 bytes of memory in hex (more in "How to read the output") |
+      | `set $eax = 0` | change a register |
+      | `attach PID` / `detach` | take control of an already-running process / let it go |
+      | `kill`, `quit` | stop the program / leave gdb |
+
+      gdb here loads **pwndbg**, an add-on that redraws registers, the stack and
+      the next instructions every time the program stops. It makes the screen
+      busy but the commands above work the same.
+
+      **gdb and the flag.** The challenge programs are **setuid**: they run with
+      extra permission so they can read `/flag`. Linux removes that permission when
+      a debugger starts the program. Use gdb to learn how the program works, then
+      run it normally with your answer to get the flag. (**gdb-runtime** is built
+      differently; its README explains how.)
+
+  - name: "Worked example: reversing a toy password check"
+    type: markdown
+    content: |
+      This is a toy program written for this lesson. It is **not** one of the
+      challenges, and its rule is different from all of them. We pretend we have
+      never seen its source; the source is at the end. Every output below was
+      captured from real runs. Where we cut lines, we say so.
+
+      The program is `toylock-stripped`. It asks for a password.
+
+      ## Step 1: look
+
+      ```
+      $ file toylock-stripped
+      toylock-stripped: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=074a0d112cebca200cfecfc122f14d0e531efdc5, for GNU/Linux 3.2.0, stripped
+      ```
+
+      64-bit Linux program (**ELF** is the Linux program file format),
+      **executable** (not PIE, so fixed addresses), **stripped** (no function
+      names).
+
+      ```
+      $ strings toylock-stripped        (excerpt: the lines that look like messages)
+      Password:
+      Door open.
+      Wrong.
+      ```
+
+      The messages are there; the password is not. It is probably encoded.
+
+      ```
+      $ echo abcdefgh | ltrace ./toylock-stripped
+      printf("Password: ")                             = 10
+      fgets("abcdefgh\n", 64, 0x70b90aa608e0)          = 0x7ffcf25abfc0
+      strcspn("abcdefgh\n", "\n")                      = 8
+      strlen("abcdefgh")                               = 8
+      memcmp(0x7ffcf25abfa8, 0x402010, 8, 16)          = 15
+      puts("Wrong.")                                   = 7
+      Password: Wrong.
+      +++ exited (status 0) +++
+      ```
+
+      Each line is one library call: the function, its arguments, and after `=`
+      what it returned. Clues:
+
+      - `fgets` reads our line; `strcspn` finds the newline so it can be removed.
+      - `strlen` measures our input. Maybe the length is checked.
+      - `memcmp` compares 8 bytes at two addresses and returned 15 (not 0, so
+        they differ). One address (`0x7ff...`) is on the stack; the other,
+        `0x402010`, is a fixed address inside the program. Our text
+        `abcdefgh` is not passed to `memcmp` directly, so something changed it
+        first. (`memcmp` takes three arguments; ltrace guessed a fourth, `16`,
+        which is leftover junk.)
+
+      **Guess:** the program transforms our 8 characters and compares the result
+      with 8 stored bytes at `0x402010`.
+
+      ## Step 2: find main
+
+      ```
+      $ readelf -h toylock-stripped        (excerpt)
+        Type:                              EXEC (Executable file)
+        Entry point address:               0x4010f0
+      ```
+
+      ```
+      $ objdump -d -M intel toylock-stripped        (excerpt, from 0x4010f0)
+        4010f0:       f3 0f 1e fa             endbr64
+        4010f4:       31 ed                   xor    ebp,ebp
+        4010f6:       49 89 d1                mov    r9,rdx
+        4010f9:       5e                      pop    rsi
+        4010fa:       48 89 e2                mov    rdx,rsp
+        4010fd:       48 83 e4 f0             and    rsp,0xfffffffffffffff0
+        401101:       50                      push   rax
+        401102:       54                      push   rsp
+        401103:       45 31 c0                xor    r8d,r8d
+        401106:       31 c9                   xor    ecx,ecx
+        401108:       48 c7 c7 ac 12 40 00    mov    rdi,0x4012ac
+        40110f:       ff 15 c3 2e 00 00       call   QWORD PTR [rip+0x2ec3]        # 403fd8 <fgets@plt+0x2ef8>
+        401115:       f4                      hlt
+      ```
+
+      `mov rdi,0x4012ac`, then `call`, then `hlt`: **`main` is at `0x4012ac`**.
+      The label `<fgets@plt+0x2ef8>` is one of objdump's invented names. The call
+      really goes through the slot at `0x403fd8`, and `readelf -r` confirms that
+      slot belongs to `__libc_start_main`:
+
+      ```
+      $ readelf -r toylock-stripped | grep 403fd8
+      000000403fd8  000100000006 R_X86_64_GLOB_DAT 0000000000000000 __libc_start_main@GLIBC_2.34 + 0
+      ```
+
+      ## Step 3: static analysis with Ghidra
+
+      This is Ghidra's decompiler output (captured with the headless script from
+      "Ghidra and gdb in this dojo"; the GUI's Decompile panel shows the same). Ghidra
+      calls `main` `FUN_004012ac`, after its address:
+
+      ```c
+      undefined8 FUN_004012ac(void)
+
+      {
+        int iVar1;
+        char *pcVar2;
+        undefined8 uVar3;
+        size_t sVar4;
+        char local_48 [64];
+
+        printf("Password: ");
+        pcVar2 = fgets(local_48,0x40,stdin);
+        if (pcVar2 == (char *)0x0) {
+          uVar3 = 1;
+        }
+        else {
+          sVar4 = strcspn(local_48,"\n");
+          local_48[sVar4] = '\0';
+          iVar1 = FUN_0040124b(local_48);
+          if (iVar1 == 0) {
+            puts("Wrong.");
+          }
+          else {
+            puts("Door open.");
+          }
+          uVar3 = 0;
+        }
+        return uVar3;
+      }
+      ```
+
+      Read it top to bottom: read up to 64 bytes into `local_48`, cut off the
+      newline, call `FUN_0040124b` with our text. If it returns 0, "Wrong.";
+      otherwise "Door open.". So `FUN_0040124b` is the checker. In the GUI you
+      would now press **L** on it and rename it `check`.
+
+      ```c
+      bool FUN_0040124b(char *param_1)
+
+      {
+        int iVar1;
+        size_t sVar2;
+        bool bVar3;
+        undefined1 local_10 [8];
+
+        sVar2 = strlen(param_1);
+        if (sVar2 == 8) {
+          FUN_004011d6(param_1,local_10,8);
+          iVar1 = memcmp(local_10,&DAT_00402010,8);
+          bVar3 = iVar1 == 0;
+        }
+        else {
+          bVar3 = false;
+        }
+        return bVar3;
+      }
+      ```
+
+      This matches the ltrace guess. The password must be exactly 8 characters.
+      `FUN_004011d6` is given our text, an 8-byte buffer `local_10`, and the number
+      8; then the buffer is compared with the 8 bytes at `0x402010`
+      (`DAT_00402010` is Ghidra's name for "some data at this address"). So
+      `FUN_004011d6` fills the buffer from our input: it is the encode step.
+
+      ```c
+      void FUN_004011d6(long param_1,long param_2,int param_3)
+
+      {
+        int local_c;
+
+        for (local_c = 0; local_c < param_3; local_c = local_c + 1) {
+          *(char *)(param_2 + local_c) =
+               (char)local_c + *(char *)(param_1 + local_c) ^ (&DAT_00402008)[local_c % 4];
+        }
+        return;
+      }
+      ```
+
+      Rename in your head: `param_1` is `in`, `param_2` is `out`, `param_3` is `n`,
+      `local_c` is `i`, `DAT_00402008` is `KEY`. Then the line reads:
+
+      ```c
+      out[i] = (i + in[i]) ^ KEY[i % 4];
+      ```
+
+      C does `+` before `^`, so the addition happens first. `KEY[i % 4]` is a
+      **4-entry lookup table** at `0x402008`: position 0 uses `KEY[0]`, position 4
+      uses `KEY[0]` again.
+
+      **Check the decompiler against the assembly** when it matters. Here is the
+      same loop from objdump (excerpt; objdump's invented `<fgets@plt+...>` labels
+      left as they are):
+
+      ```
+        4011e9:       c7 45 fc 00 00 00 00    mov    DWORD PTR [rbp-0x4],0x0
+        4011f0:       eb 4d                   jmp    40123f <fgets@plt+0x15f>
+        4011f2:       8b 45 fc                mov    eax,DWORD PTR [rbp-0x4]
+        4011f5:       48 63 d0                movsxd rdx,eax
+        4011f8:       48 8b 45 e8             mov    rax,QWORD PTR [rbp-0x18]
+        4011fc:       48 01 d0                add    rax,rdx
+        4011ff:       0f b6 00                movzx  eax,BYTE PTR [rax]
+        401202:       89 c2                   mov    edx,eax
+        401204:       8b 45 fc                mov    eax,DWORD PTR [rbp-0x4]
+        401207:       01 d0                   add    eax,edx
+        401209:       89 c1                   mov    ecx,eax
+        40120b:       8b 55 fc                mov    edx,DWORD PTR [rbp-0x4]
+        40120e:       89 d0                   mov    eax,edx
+        401210:       c1 f8 1f                sar    eax,0x1f
+        401213:       c1 e8 1e                shr    eax,0x1e
+        401216:       01 c2                   add    edx,eax
+        401218:       83 e2 03                and    edx,0x3
+        40121b:       29 c2                   sub    edx,eax
+        40121d:       89 d0                   mov    eax,edx
+        40121f:       48 98                   cdqe
+        401221:       0f b6 80 08 20 40 00    movzx  eax,BYTE PTR [rax+0x402008]
+        401228:       31 c1                   xor    ecx,eax
+        40122a:       8b 45 fc                mov    eax,DWORD PTR [rbp-0x4]
+        40122d:       48 63 d0                movsxd rdx,eax
+        401230:       48 8b 45 e0             mov    rax,QWORD PTR [rbp-0x20]
+        401234:       48 01 d0                add    rax,rdx
+        401237:       89 ca                   mov    edx,ecx
+        401239:       88 10                   mov    BYTE PTR [rax],dl
+        40123b:       83 45 fc 01             add    DWORD PTR [rbp-0x4],0x1
+        40123f:       8b 45 fc                mov    eax,DWORD PTR [rbp-0x4]
+        401242:       3b 45 dc                cmp    eax,DWORD PTR [rbp-0x24]
+        401245:       7c ab                   jl     4011f2 <fgets@plt+0x112>
+      ```
+
+      Line by line, in groups:
+
+      - `4011e9`–`4011f0`: `i = 0` (`i` lives at `[rbp-0x4]`), then jump to the
+        condition at `40123f`.
+      - `4011f2`–`4011ff`: `rax = in + i`, then read **one byte** from there:
+        `eax = in[i]`. (`in` was saved at `[rbp-0x18]` when the function started.)
+      - `401202`–`401209`: `ecx = i + in[i]`.
+      - `40120b`–`40121f`: `eax = i % 4` (the `and edx,0x3` pattern).
+      - `401221`: `eax = KEY[i % 4]`, one byte from the table at `0x402008`.
+      - `401228`: `ecx = ecx ^ eax`: the XOR.
+      - `40122a`–`401239`: write the low byte of `ecx` (`dl`) to `out[i]`.
+      - `40123b`–`401245`: `i = i + 1`; go back to `4011f2` while `i < n` (`jl`,
+        so exactly `n` rounds). `n` was saved at `[rbp-0x24]`.
+
+      Same rule as Ghidra's. Now the data. `KEY` is at `0x402008` (4 bytes) and the
+      stored answer at `0x402010` (8 bytes, from `memcmp`):
+
+      ```
+      $ objdump -s -j .rodata toylock-stripped
+
+      toylock-stripped:     file format elf64-x86-64
+
+      Contents of section .rodata:
+       402000 01000200 00000000 1337427f 00000000  .........7B.....
+       402010 63553219 76472905 50617373 776f7264  cU2.vG).Password
+       402020 3a20000a 00446f6f 72206f70 656e2e00  : ...Door open..
+       402030 57726f6e 672e00                      Wrong..
+      ```
+
+      The row starting `402000` holds addresses `0x402000` to `0x40200f`.
+      `0x402008` is 8 bytes into it: skip `01000200 00000000`, and the next four
+      bytes are the key, `13 37 42 7f`. The stored bytes start the next row:
+      `63 55 32 19 76 47 29 05`.
+
+      ## Step 4: dynamic analysis with gdb
+
+      Static analysis gave us a rule. Let us watch it happen, to make sure we read
+      it right. We stop at the `xor` (`0x401228`) and print both operands. Input is
+      `abcdefgh` from a file. (Captured with `gdb -nx -batch`, which turns pwndbg
+      off so the output is short; each command is shown before its output, and two
+      `[Thread debugging ...]` lines gdb prints after `run` are cut. Your screen
+      will also show pwndbg's panels.)
+
+      ```
+      $ echo abcdefgh > /tmp/guess.txt
+      $ gdb -q ./toylock-stripped
+      (gdb) break *0x401228
+      Breakpoint 1 at 0x401228
+      (gdb) run < /tmp/guess.txt
+      Breakpoint 1, 0x0000000000401228 in ?? ()
+      (gdb) x/1i $pc
+      => 0x401228:    xor    ecx,eax
+      (gdb) p/x $eax
+      $1 = 0x13
+      (gdb) p/x $ecx
+      $2 = 0x61
+      (gdb) continue
+      Breakpoint 1, 0x0000000000401228 in ?? ()
+      (gdb) p/x $eax
+      $3 = 0x37
+      (gdb) continue
+      Breakpoint 1, 0x0000000000401228 in ?? ()
+      (gdb) p/x $eax
+      $4 = 0x42
+      ```
+
+      Round 0: `ecx` is `0x61` (`'a'` plus 0) and `eax` is `KEY[0] = 0x13`. Rounds 1
+      and 2 bring `0x37` and `0x42`: the program is walking the table, as
+      predicted. (`?? ()` means gdb has no function name for this address,
+      because the program is stripped.)
+
+      Next, stop at the `memcmp` call (`0x40129d`) and look at both buffers. `rdi`
+      and `rsi` hold its first two arguments:
+
+      ```
+      (gdb) delete
+      (gdb) break *0x40129d
+      Breakpoint 2 at 0x40129d
+      (gdb) continue
+      Breakpoint 2, 0x000000000040129d in ?? ()
+      (gdb) x/1i $pc
+      => 0x40129d:    call   0x4010d0 <memcmp@plt>
+      (gdb) x/8bx $rdi
+      0x7fffffffeb38: 0x72    0x54    0x27    0x18    0x7a    0x5c    0x2f    0x10
+      (gdb) x/8bx $rsi
+      0x402010:       0x63    0x55    0x32    0x19    0x76    0x47    0x29    0x05
+      ```
+
+      Check the first byte by hand: `('a' + 0) ^ 0x13 = 0x61 ^ 0x13 = 0x72`. It
+      matches the first byte of our scrambled input. The rule is confirmed.
+
+      **Changing a register.** Right after `memcmp` returns, `check` runs
+      `test eax,eax` at `0x4012a2`: `eax` is 0 only if the buffers matched. In a
+      fresh gdb session, stop there, overwrite `eax`, and continue:
+
+      ```
+      (gdb) break *0x4012a2
+      Breakpoint 1 at 0x4012a2
+      (gdb) run < /tmp/guess.txt
+      Breakpoint 1, 0x00000000004012a2 in ?? ()
+      (gdb) x/1i $pc
+      => 0x4012a2:    test   eax,eax
+      (gdb) p $eax
+      $1 = 15
+      (gdb) set $eax = 0
+      (gdb) p $eax
+      $2 = 0
+      (gdb) continue
+      Password: Door open.
+      [Inferior 1 (process 30) exited normally]
+      ```
+
+      With the wrong password, the door opened. This proves we found the decision
+      point. It did **not** give us the password, and in most challenges it would
+      not give you the flag either, because a program started by gdb loses its
+      permission to read `/flag`.
+
+      ## Step 5: turn the rule into a script
+
+      The program did `out[i] = (in[i] + i) ^ KEY[i % 4]` and compared `out` with
+      the stored bytes. Undo it in reverse order: XOR first, then subtract `i`.
+
+      ```python
+      # Undo toylock's scramble: out[i] = (in[i] + i) ^ KEY[i % 4]
+      key = bytes.fromhex("1337427f")              # the 4-byte table at 0x402008
+      secret = bytes.fromhex("6355321976472905")   # the 8 bytes at 0x402010
+
+      password = []
+      for i, b in enumerate(secret):
+          x = b ^ key[i % 4]          # undo the XOR first (it was done last)
+          x = (x - i) & 0xff          # then undo "+ i", keeping one byte
+          password.append(x)
+
+      print(bytes(password).decode())
+      ```
+
+      ```
+      $ python3 undo_toylock.py
+      pancakes
+      ```
+
+      ## Step 6: confirm on the real program
+
+      ```
+      $ python3 undo_toylock.py | ./toylock-stripped
+      Password: Door open.
+      ```
+
+      Done: the program itself accepted the answer.
+
+      ## The source, revealed
+
+      ```c
+      #include <stdio.h>
+      #include <string.h>
+
+      static const unsigned char KEY[4] = { 0x13, 0x37, 0x42, 0x7f };
+      static const unsigned char SECRET[8] = {
+          0x63, 0x55, 0x32, 0x19, 0x76, 0x47, 0x29, 0x05
+      };
+
+      static void scramble(const char *in, unsigned char *out, int n)
+      {
+          for (int i = 0; i < n; i++)
+              out[i] = (in[i] + i) ^ KEY[i % 4];
+      }
+
+      int check(const char *guess)
+      {
+          unsigned char buf[8];
+
+          if (strlen(guess) != 8)
+              return 0;
+          scramble(guess, buf, 8);
+          return memcmp(buf, SECRET, 8) == 0;
+      }
+
+      int main(void)
+      {
+          char line[64];
+
+          printf("Password: ");
+          if (!fgets(line, sizeof line, stdin))
+              return 1;
+          line[strcspn(line, "\n")] = '\0';
+          if (check(line))
+              puts("Door open.");
+          else
+              puts("Wrong.");
+          return 0;
+      }
+      ```
+
+      Built with the same options as this module's challenges, then stripped:
+
+      ```bash
+      gcc -O0 -fno-stack-protector -no-pie -fno-pie -o toylock toylock.c
+      cp toylock toylock-stripped
+      strip toylock-stripped
+      ```
+
+      To follow along, save the source as `~/toylock.c` and run those three
+      commands in your home directory. If your addresses differ from the ones
+      above, trust yours.
+
+  - name: "How to read the output"
+    type: markdown
+    content: |
+      ## objdump -d -M intel
+
+      ```
+        401221:       0f b6 80 08 20 40 00    movzx  eax,BYTE PTR [rax+0x402008]
+        ^^^^^^        ^^^^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        address       the instruction's       the instruction, Intel syntax:
+        (hex)         raw bytes (hex)         DESTINATION first, then SOURCE
+      ```
+
+      The raw bytes are what the CPU reads. You can usually ignore them, but notice
+      that the constant `0x402008` is visible in them backwards (`08 20 40 00`):
+      x86-64 is **little-endian** and stores the lowest byte of a number first.
+
+      Text after `#` is objdump's comment, often the address an `rip`-relative
+      operand works out to. Text in `< >` is the nearest known symbol, which in a
+      stripped program is often wrong.
+
+      ## Memory operands
+
+      Square brackets mean "the memory at this address". The word in front says
+      how many bytes:
+
+      | word | bytes | C type, roughly |
+      |---|---|---|
+      | `BYTE PTR` | 1 | `char` |
+      | `WORD PTR` | 2 | `short` |
+      | `DWORD PTR` | 4 | `int` |
+      | `QWORD PTR` | 8 | `long`, any pointer |
+
+      - `DWORD PTR [rbp-0x4]`: the 4 bytes starting 4 below `rbp`. At `-O0` local
+        variables live at fixed distances below `rbp`.
+      - `BYTE PTR [rax+0x402008]`: one byte at address `0x402008 + rax`, a table
+        read.
+      - `lea rax,[rbp-0x8]` computes the address `rbp-0x8` and does **not** read
+        memory. It is how code gets a pointer to a local buffer.
+      - `movzx` reads a small value and fills the rest of the register with zeros.
+        `movsxd` copies a signed 4-byte value into an 8-byte register.
+
+      The stack frame of `check` in the worked example:
+
+      ```
+       higher addresses
+         rbp+0x8    return address (where check goes back to in main)
+         rbp        saved rbp of main
+         rbp-0x8    buf[0] .. buf[7]       8 bytes; Ghidra calls it local_10
+         rbp-0x10   (unused)
+         rbp-0x18   copy of the guess pointer (rdi, saved at entry)
+         rbp-0x20   <- rsp, after sub rsp,0x20
+       lower addresses
+      ```
+
+      Ghidra's `local_10` and objdump's `rbp-0x8` are the same bytes. Ghidra
+      measures from where the stack pointer was before the function's `push rbp`,
+      which is 8 bytes higher than `rbp`, so its numbers are 8 bigger in functions
+      like this one.
+
+      ## Ghidra's names
+
+      | name | meaning |
+      |---|---|
+      | `FUN_004011d6` | a function at `0x4011d6` with no symbol |
+      | `DAT_00402010` | data at `0x402010` |
+      | `PTR_..._00403fd8` | a stored address (pointer) at `0x403fd8` |
+      | `param_1`, `param_2` | the function's arguments, in order |
+      | `local_10` | a local variable on the stack (see above) |
+      | `iVar1`, `uVar3`, `sVar2`, `bVar3`, `pcVar2` | values Ghidra made up to hold a result: `i` int, `u` unsigned or unknown, `s` `size_t`, `b` bool, `pc` pointer to char |
+      | `undefined8`, `undefined1` | "8 bytes (or 1 byte) of something; I don't know the type" |
+
+      The decompiler guesses types and can print expressions that are correct but
+      hard to read. Read carefully around `^`, `<<` and casts, and confirm in the
+      assembly or in gdb when the answer depends on it.
+
+      ## objdump -s (a section's raw bytes)
+
+      ```
+       402000 01000200 00000000 1337427f 00000000  .........7B.....
+       ^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+       start  16 bytes, in groups of 4             the same bytes as text
+       address                                     ('.' = not printable)
+      ```
+
+      The bytes are in memory order. To find an array, count bytes from the start
+      of the row to the array's address: each pair of hex digits is one byte.
+
+      ## gdb's x command
+
+      `x/NFU ADDRESS` means "examine N units of size U, shown in format F".
+
+      | F | format | U | unit size |
+      |---|---|---|---|
+      | `x` | hex | `b` | 1 byte |
+      | `d` | decimal | `h` | 2 bytes |
+      | `s` | text string | `w` | 4 bytes |
+      | `i` | instruction | `g` | 8 bytes |
+
+      The same 8 bytes, the toy's `KEY` table and the 4 zero bytes after it, three
+      ways:
+
+      ```
+      (gdb) x/8bx 0x402008
+      0x402008:       0x13    0x37    0x42    0x7f    0x00    0x00    0x00    0x00
+      (gdb) x/2wx 0x402008
+      0x402008:       0x7f423713      0x00000000
+      (gdb) x/1gx 0x402008
+      0x402008:       0x000000007f423713
+      (gdb) x/s 0x402018
+      0x402018:       "Password: "
+      ```
+
+      `x/8bx` shows bytes in memory order. `x/2wx` and `x/1gx` group them into
+      numbers, and because of little-endian order the first byte (`0x13`) becomes
+      the **last** two hex digits. When you copy bytes out of memory, use the `b`
+      form.
+
+  - name: "Glossary"
+    type: markdown
+    content: |
+      - **address**: a number naming one byte of memory.
+      - **argument registers**: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, which hold a
+        function's first six arguments on x86-64 Linux. `rax`/`eax` holds the
+        return value.
+      - **attach**: make gdb take control of a process that is already running.
+      - **binary**: a compiled program file (as opposed to source code).
+      - **breakpoint**: a place where the debugger stops the program.
+      - **decode / encode**: turn scrambled bytes back into readable data / the
+        reverse. Here, a simple reversible rule, not real encryption.
+      - **decompiler**: a tool that turns machine code into approximate C (Ghidra).
+      - **disassembler**: a tool that turns machine code into assembly text
+        (`objdump`).
+      - **dynamic analysis**: learning about a program by running it and watching.
+      - **ELF**: the file format of Linux programs.
+      - **entry point**: the address where a program starts running; shown by
+        `readelf -h`.
+      - **function pointer**: a stored address of a function, called through a
+        register (an **indirect call**).
+      - **hex (hexadecimal)**: base 16, digits `0`–`9` and `a`–`f`; `0x` marks it.
+        Two hex digits make one byte.
+      - **immediate**: a constant written inside an instruction, such as `0x3` in
+        `and edx,0x3`.
+      - **index**: the position of an element in an array or table.
+      - **`__libc_start_main`**: the C library function that `_start` calls; it
+        calls `main`.
+      - **little-endian**: storing the lowest byte of a number first in memory.
+      - **lookup table**: a stored array of constants that code reads at a computed
+        position.
+      - **loop counter**: the variable (often `i`) that counts the rounds of a loop.
+      - **non-PIE / PIE**: a program that loads at a fixed address / at a random
+        address each run.
+      - **process / PID**: a running copy of a program / the number Linux uses to
+        name it.
+      - **pwndbg**: an add-on that makes gdb show registers, stack and code
+        automatically.
+      - **radare2 (`r2`)**: a command-line reverse-engineering tool; `pdg` runs
+        Ghidra's decompiler inside it.
+      - **register**: a small, fast storage slot inside the CPU (`rax`, `rdi`, ...).
+      - **`.rodata`**: the section of a program holding read-only data: constants,
+        strings, tables.
+      - **reverse engineering**: working out how a program works from the program
+        itself.
+      - **setuid**: a file permission that makes a program run with its owner's
+        rights; here, enough to read `/flag`.
+      - **stack**: memory where a function keeps its local variables; `rbp` marks
+        the current function's part of it.
+      - **`_start`**: the startup code at the entry point.
+      - **static analysis**: learning about a program by reading it without running
+        it.
+      - **stripped**: with the symbol table removed.
+      - **symbol**: a name attached to an address (`main`, `KEY`).
+      - **`.text`**: the section of a program holding its instructions.
+      - **XOR**: exclusive OR; a bit is 1 where the two inputs differ. Applying the
+        same XOR twice undoes it.
+
+  - name: "Common mistakes, and where to go next"
+    type: markdown
+    content: |
+      ## Common mistakes
+
+      - **Trusting objdump's `<name+0x...>` labels in a stripped program.** Use the
+        address. The name is a guess.
+      - **Using numbers from someone else's copy.** Each challenge comes in several
+        versions with different constants. Only the program in your `/challenge`
+        counts.
+      - **Undoing steps in the wrong order.** If the program added and then XORed,
+        you XOR first and then subtract.
+      - **Forgetting `& 0xff` in Python.** Python numbers never wrap; the program's
+        bytes do.
+      - **Off by one on the loop length.** `jl` means `i < N` (N rounds); `jle`
+        means `i <= N` (N + 1 rounds).
+      - **Counting `.rodata` bytes from the start of the row** instead of from the
+        array's own address.
+      - **Reading `x/gx` or `x/wx` output as bytes.** Little-endian order reverses
+        them. Use `x/Nbx` to copy bytes.
+      - **`break 0x401228` without the `*`.** gdb then looks for a function by that
+        name. Use `break *0x401228`.
+      - **Expecting the flag while running under gdb.** The debugger removes the
+        permission to read `/flag`. Learn in gdb, then run the program normally.
+        (gdb-runtime is the exception; its README explains why.)
+      - **Believing the decompiler over the program.** Ghidra's C is a guess. When
+        an answer depends on a detail, check the assembly or watch it in gdb.
+      - **Giving up on the loop and guessing.** Write down what one round does to
+        one byte, check it on the first byte by hand (as in the worked example),
+        then write the script.
+
+      ## Where to go next
+
+      - [pwn.college Program Security dojo](https://pwn.college/program-security/):
+        its **Reverse Engineering** module is the next step up, with many more
+        crackme-style levels.
+      - Ghidra's own course is already installed: open
+        `/opt/ghidra/docs/GhidraClass/Beginner/` in the Desktop workspace, and keep
+        `/opt/ghidra/docs/CheatSheet.html` open while you work.
+      - [Beej's Quick Guide to GDB](https://beej.us/guide/bggdb/): a short gdb
+        tutorial.
+      - [Reverse Engineering for Beginners](https://beginners.re/) by Dennis
+        Yurichev: a free book that shows what C turns into, compiler by compiler.
+      - [Compiler Explorer](https://godbolt.org/): write C and see the assembly
+        next to it. Choose x86-64 gcc with `-O0 -masm=intel` to match this module.
+      - [crackmes.one](https://crackmes.one/): small practice programs made by
+        other people, rated by difficulty.

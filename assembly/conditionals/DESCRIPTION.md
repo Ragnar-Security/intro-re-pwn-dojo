@@ -1,0 +1,1 @@
+The program checks your number with a chain of comparisons and only one narrow set of numbers gets through to the flag. Read each comparison in the assembly and work out what the number must look like.

@@ -1,0 +1,2 @@
+#!/bin/sh
+chmod 0755 /challenge/mystery-a /challenge/mystery-b /challenge/mystery-c

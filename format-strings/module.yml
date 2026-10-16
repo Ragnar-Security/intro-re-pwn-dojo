@@ -1,0 +1,354 @@
+name: Format Strings
+description: |
+  Learn why untrusted text must not be used as a printf format string, then use
+  the bug to inspect program memory.
+
+  Start with the "Start here" resource below. It explains what `printf` does
+  with its format string, where `printf` finds its values, and how to read them
+  back out. Suggested order: fmt-leak, then fmt-read.
+challenges:
+  - id: fmt-leak
+    name: Leak Values from Memory
+  - id: fmt-read
+    name: Read a Chosen Address
+resources:
+  - name: "Start here: what this module is about"
+    type: markdown
+    content: |
+      `printf` builds text from a **format string**: a template with markers such as
+      `%d` that say "put a value here." A program can contain this bug: instead of
+      writing `printf("%s", text)`, the programmer writes `printf(text)`. If `text`
+      came from a user, the user now controls the template, and can type markers
+      that the programmer never meant to offer.
+
+      This matters for reverse engineering and exploitation because `printf` has no
+      way to check how many values it was given. A marker with no matching value
+      does not fail. `printf` reads whatever happens to be in the place where that
+      value would have been. That place is the program's own registers and stack,
+      so a user who controls the template can make the program print its own
+      memory back at them.
+
+      In this module you will:
+
+      1. Learn what each marker does.
+      2. Learn where `printf` looks for its values on x86-64.
+      3. Use that to print values the program never meant to show (`fmt-leak`).
+      4. Use it to print text stored at an address of your choosing (`fmt-read`).
+
+      You need a little C, and the idea that variables live at addresses. If
+      pointers are new, read the C Warmup module's "Pointers and memory in one
+      page" first.
+
+  - name: "Format markers, from zero"
+    type: markdown
+    content: |
+      A **format string** is the first argument of `printf`. Ordinary characters
+      are printed as they are. A **marker** (also called a conversion specifier)
+      starts with `%` and is replaced by the next value:
+
+      | Marker | Prints the value as | Example output |
+      |---|---|---|
+      | `%d` | a signed decimal number (32-bit) | `255` |
+      | `%x` | hexadecimal, lowercase (32-bit) | `ff` |
+      | `%lx` | hexadecimal, 64-bit (`l` means "long") | `1122334455667788` |
+      | `%c` | one character | `Z` |
+      | `%s` | text: the value is an **address**, and `printf` prints bytes from there until a zero byte | `text` |
+      | `%p` | a pointer: 64-bit hexadecimal with `0x` in front; zero prints as `(nil)` | `0x402004` |
+      | `%n` | nothing. It **writes** a count of characters printed so far, to an address | (see below) |
+      | `%%` | a literal `%` | `%` |
+
+      Real output from a small test program (`printf("%d|%5d|%x|%X|%c|%s|%p\n", 255, 255, 255, 255, 'Z', "text", (void *)0)`):
+
+      ```
+      255|  255|ff|FF|Z|text|(nil)
+      ```
+
+      `%5d` means "at least 5 characters wide," which is why there are two spaces
+      before the second `255`.
+
+      **Hexadecimal** (base 16) uses the digits `0-9` and `a-f`. One hex digit
+      is 4 bits, so a 64-bit value is 16 hex digits.
+
+      ### Why `%s` is different
+      `%d` and `%p` print the value itself. `%s` treats the value as an address and
+      **follows** it. That is the first marker that can read memory you did not
+      pass in directly, and it can crash the program: if the value is not a valid
+      address, the read fails (a segmentation fault).
+
+      ### Why `%n` is dangerous
+      `%n` does the opposite of printing. It takes an address from the arguments
+      and **stores** how many characters have been printed so far at that address.
+
+      ```c
+      int written = 0;
+      printf("abcde%n\n", &written);
+      printf("written = %d\n", written);
+      ```
+      ```
+      abcde
+      written = 5
+      ```
+
+      If an attacker controls the format string, `%n` lets them write into the
+      program's memory, not only read it. Combined with a way to control the count
+      (for example `%100d`), that is a general "write a chosen number to a chosen
+      address" tool. **You do not need `%n` in this module.** Both challenges can be
+      completed by reading only. It is here so you know why this bug is serious,
+      and why compilers warn about it.
+
+  - name: "Where printf finds its values (x86-64)"
+    type: markdown
+    content: |
+      When C calls a function, the arguments have to go somewhere the function can
+      find them. On 64-bit Linux (the **System V calling convention**), the rule
+      is:
+
+      - The first six arguments go in six **registers**, in a fixed order:
+        `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`. (A register is a tiny named
+        storage slot inside the CPU.)
+      - Any further arguments are pushed on the **stack**, the region of memory
+        the function uses for its local variables.
+
+      For `printf`, the format string is the first argument, so it uses `rdi`.
+      That leaves five registers and then the stack for the values:
+
+      ```
+      printf( fmt , v1 , v2 , v3 , v4 , v5 , v6 , v7 , v8 ... )
+                |     |    |    |    |    |    |    |    |
+                rdi   rsi  rdx  rcx  r8   r9  [stack slots, 8 bytes each]
+
+      marker number:   %1$   %2$  %3$  %4$  %5$  %6$   %7$   %8$ ...
+      ```
+
+      Here is the real compiled code for
+      `printf("%d %d %d %d %d %d %d %d\n", 11, 22, 33, 44, 55, 66, 77, 88)`,
+      from `objdump -d -M intel` (each line: address, machine-code bytes,
+      instruction):
+
+      ```
+      401142:  6a 58                push   0x58            ; 88 goes on the stack
+      401144:  6a 4d                push   0x4d            ; 77
+      401146:  6a 42                push   0x42            ; 66
+      401148:  41 b9 37 00 00 00    mov    r9d,0x37        ; 55 -> r9
+      40114e:  41 b8 2c 00 00 00    mov    r8d,0x2c        ; 44 -> r8
+      401154:  b9 21 00 00 00       mov    ecx,0x21        ; 33 -> rcx
+      401159:  ba 16 00 00 00       mov    edx,0x16        ; 22 -> rdx
+      40115e:  be 0b 00 00 00       mov    esi,0xb         ; 11 -> rsi
+      401163:  48 8d 05 9a 0e 00 00 lea    rax,[rip+0xe9a] ; address of the format string
+      40116a:  48 89 c7             mov    rdi,rax         ; format string -> rdi
+      401172:  e8 c9 fe ff ff       call   401040 <printf@plt>
+      ```
+
+      The `;` notes are added by hand. The hex values are the numbers above:
+      `0x16` is 22, `0x58` is 88. (`r9d`, `ecx`, `edx`, `esi` are the lower
+      32-bit halves of `r9`, `rcx`, `rdx`, `rsi`; writing one clears the rest.)
+      The first five values are in registers. The last three were pushed on the
+      stack in reverse order, so that 66 ends up on top, where `printf` looks
+      first.
+
+      ### What happens when the programmer forgets the values
+      With `printf(text)` there is **only** the format string. Registers `rsi`
+      through `r9` still hold whatever the program was doing before the call. The
+      stack above `printf`'s return address still holds the caller's local
+      variables. `printf` does not know that, so a `%p` takes the next slot as if
+      someone had passed it.
+
+      ```
+      what printf reads for   %1$p %2$p %3$p %4$p %5$p   %6$p   %7$p   ...
+                               ---- leftovers in registers ---   --- the stack ---
+                               rsi  rdx  rcx  r8   r9         [slot]  [slot]
+                                                                 |
+                                       the caller's local variables are here
+      ```
+
+      So the numbered markers `%6$p`, `%7$p`, and so on show you the stack, one
+      8-byte slot at a time, in order from lower to higher addresses. The slots
+      you see include the caller's local variables and, with luck, your own typed
+      line, because that was stored in a local variable too.
+
+      ### Positional markers: `%N$p`
+      `%7$p` means "print argument number N=7" directly, without printing the six
+      before it. Numbering starts at 1 for the first value *after* the format
+      string, so `%1$p` is `rsi`, and `%6$p` is the first stack slot. This is why
+      you can probe one slot at a time instead of typing a very long line.
+
+  - name: "Worked example: a toy program you can try yourself"
+    type: markdown
+    content: |
+      This program is **not** one of the challenges. It stores a few variables, reads
+      a line, and prints it back with the bug:
+
+      ```c
+      #include <stdio.h>
+
+      int main(void) {
+          char line[64];
+          const char *motto = "carpe diem";
+          unsigned long code = 0x1122334455667788UL;
+
+          fgets(line, sizeof line, stdin);
+          printf(line);               /* the bug: input used as the format */
+          printf("\n");
+          return motto[0] + (int)(code & 1);
+      }
+      ```
+
+      Compile it with the protections that would get in the way of learning
+      turned off (the compiler also warns about the exact bug, which is a good sign
+      you should read compiler warnings):
+
+      ```
+      gcc -O0 -no-pie -fno-stack-protector -o toy toy.c
+      toy.c: warning: format not a string literal and no format arguments [-Wformat-security]
+      ```
+
+      **Step 1: normal input is harmless.**
+
+      ```
+      $ echo hello | ./toy
+      hello
+      ```
+
+      **Step 2: markers with no values.** `%d` takes a 32-bit part of the next slot:
+
+      ```
+      $ echo '%d %d' | ./toy
+      1680154724 -72540024
+      ```
+
+      These are leftover register contents. They change from run to run, because
+      the addresses they come from are randomised (ASLR).
+
+      **Step 3: print many slots with `%p`.**
+
+      ```
+      $ echo '%p %p %p %p %p %p %p %p %p %p %p %p %p %p %p %p' | ./toy
+      0x1e57c2a1 0xfbad2088 0xe1a83d5f 0x1e57c2d0 (nil) 0x7025207025207025 0x2520702520702520 0x2070252070252070 0x7025207025207025 0x2520702520702520 0xa70252070252070 (nil) 0x712e653e9af0 0x1122334455667788 0x402004 0x7ffdb2dd3e10
+      ```
+
+      Reading it from left to right, these are slots 1 to 16:
+
+      - Slots 1 to 5 are register leftovers (`rsi` to `r9`). Slot 5 is `(nil)`, zero.
+      - Slots 6 to 11 look like `0x7025207025207025`. That is the **text of the line
+        we typed**. The characters `%p ` (hex `25 70 20`) repeated. The `fgets` buffer
+        is on the stack, and `printf` is reading it as data. The bytes appear
+        reversed because x86-64 is **little-endian**: the lowest byte of a number
+        is stored first.
+      - Slot 14 is `0x1122334455667788`: the variable `code`. We read a local
+        variable we were never given.
+      - Slot 15 is `0x402004`. A small, fixed-looking address, close to the
+        program's own code. It is the `motto` pointer.
+      - Slot 16 starts with `0x7ffd`. Addresses beginning `0x7ff...` are on the
+        stack.
+
+      **Step 4: pick one slot with `%N$p`.**
+
+      ```
+      $ echo '%14$p' | ./toy
+      0x1122334455667788
+      ```
+
+      **Step 5: use `%s` on a slot that holds an address.** Slot 15 holds the
+      address of `"carpe diem"`, so `%s` follows it:
+
+      ```
+      $ echo '%15$s' | ./toy
+      carpe diem
+      ```
+
+      **Step 6: `%s` on a slot that does not hold a valid address crashes.** Slot
+      14 holds `code`, which is not a mapped address:
+
+      ```
+      $ echo '%14$s' | ./toy
+      Segmentation fault (core dumped)
+      ```
+
+      That crash is useful information: it tells you which slots are not
+      pointers.
+
+      **Step 7: the width matters.** `%x` prints only 32 bits, `%lx` prints 64:
+
+      ```
+      $ echo '%14$x'  | ./toy
+      55667788
+      $ echo '%14$lx' | ./toy
+      1122334455667788
+      ```
+
+      Use `%p` or `%lx` for 64-bit values; `%x` silently drops the top half.
+
+      Your numbers will differ from the listing, because the stack addresses are
+      randomised on every run and your build may place variables differently.
+      What stays true is the method: probe slot numbers, recognise what each value
+      is, and follow the interesting ones.
+
+  - name: "How to read the output, and what to look for"
+    type: markdown
+    content: |
+      When you print several slots, you have to decide what each value is.
+
+      | What you see | Likely meaning |
+      |---|---|
+      | `(nil)` or `0x0` | zero, or a pointer that is not set |
+      | `0x7ffd...` / `0x7ffe...` / `0x7fff...` (12 hex digits) | an address on the **stack** |
+      | `0x7f...` | an address in a **shared library** (such as libc) |
+      | `0x40....` or `0x55...` | an address inside the program itself |
+      | `0x4141414141414141` | your own `AAAAAAAA` (`A` is byte `0x41`) |
+      | a long, random-looking 64-bit number | possibly a secret, a key, or a canary |
+      | a short number such as `0x2a` | a counter, length, or small variable |
+
+      **Tip: put a marker on the line.** If you type `AAAAAAAA` first and then a list
+      of `%p`, the slot that prints `0x4141414141414141` is where your input
+      starts. That tells you which numbered slot reads your own buffer.
+
+      **Tip: little-endian text.** If a value looks like `0x6948`, read the bytes
+      from the right: `48 69` is the characters `H` `i`. To read a value as text,
+      split it into bytes, then reverse the order.
+
+      **Tip: a newline ends your input.** `fgets` stops reading at a newline (byte
+      `0x0a`), so a payload that contains `0x0a` is cut short. If you place an
+      address in your input as raw bytes, check it for that byte.
+
+  - name: "Glossary and common mistakes"
+    type: markdown
+    content: |
+      ## Glossary
+      - **Format string**: the first argument of `printf`; a template with markers.
+      - **Marker / conversion specifier**: a `%` sequence such as `%d` or `%s`.
+      - **Argument**: a value passed to a function.
+      - **Register**: a small named storage slot inside the CPU (`rdi`, `rsi`, ...).
+      - **Calling convention**: the agreed rule for where arguments go. On Linux
+        x86-64 it is: six registers, then the stack.
+      - **Stack**: memory a running function uses for its local variables and
+        return address.
+      - **Slot**: one 8-byte position on the stack.
+      - **Pointer**: a value that holds an address.
+      - **Hexadecimal**: base-16 numbers, digits `0-9a-f`.
+      - **Little-endian**: the lowest byte of a number is stored first.
+      - **Positional marker**: `%N$p`, which selects argument number N.
+      - **ASLR**: randomises where the stack and libraries are loaded on each run.
+      - **Leak**: making a program reveal a value it should have kept private.
+      - **Segmentation fault**: the program tried to access memory it may not use.
+
+      ## Common mistakes
+      - **Counting from zero.** Positional numbering starts at 1.
+      - **Counting the format string as argument 1.** `%1$p` is the first value
+        after the format string (`rsi`), not the string itself.
+      - **Using `%x` for a 64-bit value.** It prints only the low 32 bits.
+      - **Mixing up which end is which.** A little-endian value prints with the
+        last byte of memory first; read text out of it from the right.
+      - **Assuming a number you saw earlier is still valid.** Random addresses
+        change per run, so a number you copy from one run is stale in the next.
+      - **Using `%s` on a slot you have not checked.** A bad address crashes the
+        program. Print the slot with `%p` first and see whether it looks like an
+        address.
+      - **Typing a marker into your own shell.** In a shell, `%` is fine inside
+        quotes, but `$` is not: `echo %7$p` loses the `$p`. Use single quotes:
+        `echo '%7$p'`.
+
+      ## Where to go next
+      - pwn.college's free introductory modules on memory errors and format strings:
+        https://pwn.college
+      - `man 3 printf` explains every marker, including positional ones.
+      - The System V AMD64 ABI document describes the calling convention in full.

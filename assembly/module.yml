@@ -1,0 +1,1491 @@
+name: Assembly Basics
+description: |
+  Learn to read x86-64 assembly, the instructions a CPU actually runs. You will
+  follow how a program moves numbers between registers and memory, compares
+  them, loops, and calls functions.
+
+  **New to assembly? Read the numbered lesson pages below first, in order.**
+  They start from zero and explain everything these challenges use, with a
+  worked example on a small practice program (not one of the challenges).
+
+  Suggested challenge order: registers, arithmetic, endianness, conditionals,
+  loops, stack-frame, calling-convention. Each challenge exists in several
+  versions with different numbers. Your copy is the one in `/challenge`, so do
+  not trust numbers from someone else's copy.
+
+challenges:
+  - id: registers
+    name: Registers
+  - id: arithmetic
+    name: Arithmetic
+  - id: endianness
+    name: Endianness
+  - id: conditionals
+    name: Conditionals
+  - id: loops
+    name: Loops
+  - id: stack-frame
+    name: Stack Frames
+  - id: calling-convention
+    name: Calling Conventions
+resources:
+  - name: "1. Start here: what assembly is"
+    type: markdown
+    content: |
+      ## What this module is about
+
+      A CPU does not understand C, Python, or any language people write. It runs
+      **machine code**: a long list of small numeric commands called
+      **instructions**, such as "add these two numbers" or "jump to that
+      address". **Assembly** is the same instructions written as short words so
+      a person can read them. A **compiler** (such as `gcc`) turns C into machine
+      code. A **disassembler** (such as `objdump`) turns machine code back into
+      assembly.
+
+      When you reverse engineer a program, you usually have only the compiled
+      file, never the source code, so assembly is what you read. When you
+      exploit a bug, you need to know where data sits in memory and what the CPU
+      will do next, and both are written in assembly. This module teaches you to
+      read it.
+
+      The lesson pages are in order. Read them before the challenges, and come
+      back to them while you work:
+
+      | Page | Topic |
+      |---|---|
+      | 1 | What assembly is, how to read one instruction, hex |
+      | 2 | Registers |
+      | 3 | The core instructions |
+      | 4 | Flags and conditional jumps (signed versus unsigned) |
+      | 5 | The stack and stack frames |
+      | 6 | The calling convention (how functions get their arguments) |
+      | 7 | Byte order (little-endian) |
+      | 8 | Loops |
+      | 9 | Worked example: one program, from C to objdump to gdb |
+      | 10 | How to read objdump and gdb output |
+      | 11 | Glossary |
+      | 12 | Common mistakes |
+      | 13 | Where to go next, and a one-page cheat sheet |
+
+      ## The practice program used in these pages
+
+      Every output in these pages is real. It comes from this small program,
+      which is **not** one of the challenges. It was compiled and run in the
+      same environment as the challenges.
+
+      ```c
+      #include <stdio.h>
+
+      /* Straight-line math: two arguments, one local, one return value. */
+      int mix(int a, int b) {
+          int t = a * b;
+          t = t + 100;
+          return t - a;
+      }
+
+      /* A loop: add up the numbers 1..n. */
+      int sum_to(int n) {
+          int total = 0;
+          for (int i = 1; i <= n; i++) {
+              total += i;
+          }
+          return total;
+      }
+
+      /* A pointer argument: change the caller's variable. */
+      void bump(int *p) {
+          *p = *p + 1;
+      }
+
+      int main(void) {
+          long big = 0x1122334455667788;
+          int m = mix(5, 7);
+          int s = sum_to(4);
+          bump(&s);
+          printf("%d %d %lx\n", m, s, big);
+          return 0;
+      }
+      ```
+
+      It prints `130 11 1122334455667788`. You can build the same thing in your
+      dojo workspace: save it as `toy.c` and run
+      `gcc -O0 -fno-stack-protector -no-pie -fno-pie -o toy toy.c`.
+
+      ## One line of C becomes a few instructions
+
+      Here is `mix` next to the assembly `gcc` made for it. The text after each
+      `;` is a comment added for you; objdump does not print it.
+
+      ```
+      C                    assembly
+      -------------------  ------------------------------------------------------
+      int t = a * b;       mov  eax,DWORD PTR [rbp-0x14]   ; eax = a
+                           imul eax,DWORD PTR [rbp-0x18]   ; eax = eax * b
+                           mov  DWORD PTR [rbp-0x4],eax    ; t = eax
+      t = t + 100;         add  DWORD PTR [rbp-0x4],0x64   ; t = t + 100   (0x64 is 100)
+      return t - a;        mov  eax,DWORD PTR [rbp-0x4]    ; eax = t
+                           sub  eax,DWORD PTR [rbp-0x14]   ; eax = eax - a (the answer)
+      ```
+
+      Three things to notice:
+
+      - **Variable names are gone.** `a`, `b` and `t` became places in memory:
+        `[rbp-0x14]`, `[rbp-0x18]` and `[rbp-0x4]`. Reading assembly is mostly
+        working out which place holds which variable. Page 5 explains `rbp`.
+      - **Numbers are in hex.** `100` is written `0x64`.
+      - **The CPU works through registers.** `eax` is a register, a small
+        storage slot inside the CPU (page 2). Most instructions can touch memory
+        in at most one operand, so values pass through registers on the way.
+
+      ## How to read one instruction
+
+      ```
+      mov    DWORD PTR [rbp-0x4],eax
+      ^^^    ^^^^^^^^^^^^^^^^^^^ ^^^
+       |            |             +-- source: where the value comes from
+       |            +---------------- destination: what gets changed
+       +----------------------------- mnemonic: the instruction's name
+      ```
+
+      This module uses **Intel syntax**: the destination comes first, like an
+      assignment in C. `mov eax, 5` means `eax = 5`. `add eax, ebx` means
+      `eax = eax + ebx`. Ask `objdump` for it with `-M intel`.
+
+      An **operand** (one of the things after the mnemonic) is one of three
+      kinds:
+
+      | Kind | Example | Means |
+      |---|---|---|
+      | register | `eax` | the value in register `eax` |
+      | immediate | `0x64` | the number itself, written inside the instruction |
+      | memory | `DWORD PTR [rbp-0x4]` | the value stored in memory at address `rbp - 4` |
+
+      The square brackets mean "go to this address in memory". The word in
+      front says how many bytes to read or write there:
+
+      | Size word | Bytes | Bits | Typical C type |
+      |---|---|---|---|
+      | `BYTE PTR` | 1 | 8 | `char` |
+      | `WORD PTR` | 2 | 16 | `short` |
+      | `DWORD PTR` | 4 | 32 | `int`, `unsigned int` |
+      | `QWORD PTR` | 8 | 64 | `long`, any pointer |
+
+      **AT&T syntax** is the other common style. It reverses the operands and
+      adds `%` and `$` signs. If `objdump` output looks like the second line
+      below, you forgot `-M intel`:
+
+      ```
+      Intel:  mov    DWORD PTR [rbp-0x14],edi
+      AT&T:   mov    %edi,-0x14(%rbp)
+      ```
+
+      ## Hex in one minute
+
+      **Hex** (base 16) uses the digits `0-9` and then `a-f` for 10 to 15. A
+      `0x` in front marks a hex number. One hex digit is exactly 4 bits, so two
+      hex digits are exactly one **byte** (8 bits). That is why programmers and
+      tools use hex for memory: `0x1122` is the two bytes `11` and `22`.
+
+      Python converts for you:
+
+      ```
+      $ python3
+      >>> hex(100)
+      '0x64'
+      >>> 0x64
+      100
+      >>> hex(0xff & 0x0f)
+      '0xf'
+      ```
+
+      **Negative numbers.** A 32-bit register holds a pattern of 32 bits and
+      nothing else. The same pattern `0xffffffff` means 4294967295 if you treat
+      it as **unsigned** (never negative) and -1 if you treat it as **signed**
+      (this way of storing negatives is called **two's complement**). The CPU does
+      not record which one you meant. The instruction that uses the value
+      decides. Page 4 shows why this matters.
+
+      **Wrap-around.** A 32-bit register keeps only the lowest 32 bits of a
+      result. `0xffffffff + 1` becomes `0`, like a car odometer rolling over. To
+      copy that in Python, keep the low 32 bits with `& 0xffffffff`.
+
+      ## Why `-O0`
+
+      The challenges here were compiled with `-O0` (no optimisation). Each C
+      statement then becomes its own short group of instructions, and every
+      local variable lives in memory on the stack. Optimised code (`-O2`) keeps
+      values in registers and reorders work, which is much harder to read. You
+      will meet it later, not in this module.
+
+  - name: "2. Registers"
+    type: markdown
+    content: |
+      A **register** is a tiny, very fast storage slot inside the CPU. x86-64
+      has 16 general-purpose registers. Each holds 64 bits (8 bytes).
+
+      ## One register, several names
+
+      You can use the whole register or only its lower part. Each part has its
+      own name. For `rax`:
+
+      ```
+      bit:         63                             32 31             16 15      8 7       0
+                  +---------------------------------+-----------------+---------+---------+
+      rax         |                         all 64 bits (8 bytes)                         |
+                  +---------------------------------+-----------------+---------+---------+
+      eax                                           |        low 32 bits (4 bytes)        |
+                                                    +-----------------+---------+---------+
+      ax                                                              |    low 16 bits    |
+                                                                      +---------+---------+
+      ah / al                                                         |   ah    |   al    |
+                                                                      +---------+---------+
+      ```
+
+      - `rax` is all 8 bytes. The `r` is for the 64-bit "register".
+      - `eax` is the low 4 bytes (the `e` is "extended", a name left over from
+        older 32-bit CPUs).
+      - `ax` is the low 2 bytes.
+      - `al` is the lowest byte ("low"). `ah` is the byte above it ("high").
+
+      An `int` is 4 bytes, so code that works on `int` uses the `e` names
+      (`eax`, `edi`). Pointers and `long` are 8 bytes, so they use the `r`
+      names (`rax`, `rdi`). The same register can appear under different names
+      a few lines apart. `eax` and `rax` are **not** different registers.
+
+      ## All sixteen
+
+      | 64-bit | 32-bit | 16-bit | 8-bit | Usual job in compiled code |
+      |---|---|---|---|---|
+      | `rax` | `eax` | `ax` | `al` | return value; scratch math |
+      | `rbx` | `ebx` | `bx` | `bl` | general |
+      | `rcx` | `ecx` | `cx` | `cl` | 4th argument |
+      | `rdx` | `edx` | `dx` | `dl` | 3rd argument |
+      | `rsi` | `esi` | `si` | `sil` | 2nd argument |
+      | `rdi` | `edi` | `di` | `dil` | 1st argument |
+      | `rbp` | `ebp` | `bp` | `bpl` | **base pointer**: marks the current function's stack frame |
+      | `rsp` | `esp` | `sp` | `spl` | **stack pointer**: the top of the stack |
+      | `r8` | `r8d` | `r8w` | `r8b` | 5th argument |
+      | `r9` | `r9d` | `r9w` | `r9b` | 6th argument |
+      | `r10` to `r15` | `r10d` ... | `r10w` ... | `r10b` ... | general |
+
+      `ah`, `bh`, `ch` and `dh` exist only for the first four. The argument
+      jobs come from the calling convention (page 6).
+
+      Two more registers matter even though you never see them as operands:
+
+      - **`rip`**, the **instruction pointer**, holds the address of the next
+        instruction to run. A jump or a call works by changing `rip`.
+      - **`rflags`** (shown as `eflags` in gdb) holds single-bit **flags** that
+        record facts about the last result, such as "it was zero". Page 4.
+
+      ## What writing a smaller name does to the rest: a real test
+
+      This is the one rule about register names that surprises everyone. We ran
+      these four instructions one at a time and printed `rax` in gdb after each
+      (`p/x $rax`):
+
+      ```
+      instruction                    rax afterwards (real gdb output)
+      ---------------------------    --------------------------------
+      mov rax, 0x1122334455667788    $1 = 0x1122334455667788
+      mov al, 0xff                   $2 = 0x11223344556677ff
+      mov ax, 0xbeef                 $3 = 0x112233445566beef
+      mov eax, 0x1                   $4 = 0x1
+      ```
+
+      - Writing `al` or `ax` changes only those bytes. The rest stays.
+      - **Writing a 32-bit name (`eax`) sets the top 4 bytes of `rax` to zero.**
+        That is why `mov eax, 0x1` left `rax` equal to `1`, not
+        `0x1122334400000001`.
+
+      You will often see `mov eax, 0x0` before a call and `xor eax, eax`
+      (a short way to set `eax`, and so all of `rax`, to zero).
+
+  - name: "3. The core instructions"
+    type: markdown
+    content: |
+      About twenty instructions cover nearly everything in this module. Every
+      example in the table below was run for real and the result checked in gdb.
+      Read `eax: 5 -> 8` as "eax held 5 before and 8 after".
+
+      ## Moving data
+
+      | Instruction | Example | What happens |
+      |---|---|---|
+      | `mov` | `mov eax, 5` | `eax = 5` |
+      | `mov` (load) | `mov eax, DWORD PTR [rbp-0x14]` | read 4 bytes from memory at `rbp-0x14` into `eax` |
+      | `mov` (store) | `mov DWORD PTR [rbp-0x4], eax` | write `eax` into the 4 bytes at `rbp-0x4` |
+      | `movabs` | `movabs rax, 0x1122334455667788` | a `mov` with a full 8-byte number (objdump's name for it) |
+      | `lea` | `lea rdx, [rax+rax*2+1]` | `rax` = 12, so `rdx` = 12 + 24 + 1 = 37. **Computes** the address in brackets and stores the number. It does not read memory. |
+      | `push` | `push rdx` | `rsp` goes down by 8, then `rdx` is written at `[rsp]` |
+      | `pop` | `pop rbx` | `rbx` = the 8 bytes at `[rsp]`, then `rsp` goes up by 8. After `push rdx` above, `rbx` = 37 |
+      | `movzx` / `movsxd` | `movsxd rdx, edx` | copy a small value into a bigger register, filling the top with zeros (`zx`) or with copies of the sign bit (`sx`, keeps negative numbers negative) |
+
+      `mov` never does math and never changes flags. You cannot `mov` from
+      memory straight to memory: the value goes through a register.
+
+      ## Math
+
+      | Instruction | Example | What happens |
+      |---|---|---|
+      | `add` | `add eax, 3` | `eax: 5 -> 8` |
+      | `sub` | `sub eax, 2` | `eax: 8 -> 6` |
+      | `imul` (3 operands) | `imul eax, eax, 7` | `eax = eax * 7`, so `eax: 6 -> 42` |
+      | `imul` (2 operands) | `imul eax, DWORD PTR [rbp-0x18]` | `eax = eax * (value in memory)` |
+      | `shl` | `shl eax, 4` | shift bits left 4 places = multiply by 2^4 = 16. `eax: 3 -> 0x30` (48) |
+      | `shr` | `shr eax, 2` | shift bits right 2 places = divide by 4, dropping the remainder. `eax: 48 -> 12` |
+
+      **The compiler does not always use `imul`.** Even at `-O0`, `gcc` may
+      write a multiply by a small constant as additions and shifts. Real output
+      for two one-line functions:
+
+      ```
+      int times3(int a)   { return a * 3; }
+      int times100(int a) { return a * 100; }
+      ```
+
+      ```
+      <times3>:                                  <times100>:
+      mov    edx,DWORD PTR [rbp-0x4]  ; edx = a   mov    eax,DWORD PTR [rbp-0x4]  ; eax = a
+      mov    eax,edx                  ; eax = a   imul   eax,eax,0x64             ; eax = a * 100
+      add    eax,eax                  ; eax = 2a
+      add    eax,edx                  ; eax = 3a
+      ```
+
+      When you see a short run of `add`, `sub` or `shl` on one value, work out
+      what it multiplies by.
+
+      ## Bit operations
+
+      These work on each bit separately. Write the numbers in binary to see it:
+
+      ```
+             0xf0 = 1111 0000                0x30 = 0011 0000              0x35 = 0011 0101
+      and    0x3c = 0011 1100       or       0x05 = 0000 0101      xor     0xff = 1111 1111
+             ----------------                ----------------              ----------------
+             0x30 = 0011 0000                0x35 = 0011 0101              0xca = 1100 1010
+             (1 where BOTH are 1)            (1 where EITHER is 1)         (1 where they DIFFER)
+      ```
+
+      | Instruction | Example | What happens |
+      |---|---|---|
+      | `and` | `and eax, 0x3c` | `eax: 0xf0 -> 0x30`. Keeps only the bits that are 1 in the mask. `and eax, 0x3` keeps the lowest 2 bits, which is the remainder after dividing by 4. |
+      | `or` | `or eax, 0x5` | `eax: 0x30 -> 0x35`. Turns bits on. |
+      | `xor` | `xor eax, 0xff` | `eax: 0x35 -> 0xca`. Flips the bits that are 1 in the mask. Doing the same `xor` twice gives back the start value. |
+      | `xor` (self) | `xor ecx, ecx` | `ecx = 0`. Any value xor itself is 0. A common way to zero a register. |
+
+      ## Comparing and jumping
+
+      | Instruction | Example | What happens |
+      |---|---|---|
+      | `cmp` | `cmp eax, 5` | works out `eax - 5`, throws the answer away, keeps only the **flags** (page 4) |
+      | `test` | `test eax, eax` | works out `eax AND eax`, keeps only the flags. `test eax, eax` asks "is eax zero?" |
+      | `jmp` | `jmp 40117f <sum_to+0x25>` | always continue at that address |
+      | `je`, `jl`, `ja`, ... | `jle 401175 <sum_to+0x1b>` | **conditional jump** (`jcc` for short): jump only if the flags say so, otherwise fall through to the next line |
+      | `call` | `call 401136 <mix>` | push the address of the next instruction (the **return address**), then jump to the function |
+      | `ret` | `ret` | pop the return address off the stack and jump back to it |
+
+      ## Others you will see and can mostly skip
+
+      - `endbr64`: a marker at the start of each function for a hardware
+        protection feature. It does nothing you need to follow.
+      - `nop`: "no operation". Does nothing.
+      - `leave`: the same as `mov rsp, rbp` then `pop rbp`. It tears down a
+        stack frame right before `ret` (page 5).
+
+      ## Memory operands in full
+
+      The part in square brackets can be up to four pieces added together:
+
+      ```
+      [ base  +  index * scale  +  displacement ]
+        rbp      rax     1,2,4,8    a fixed number
+
+      [rbp-0x14]           base rbp, displacement -0x14          (a local variable)
+      [rax]                base rax                              (follow a pointer)
+      [rax+rdx*4]          base rax, index rdx, scale 4           (element rdx of an int array)
+      [rip+0x2d41]         relative to the current instruction    (a global variable)
+      ```
+
+      ## `lea` versus `mov`: address versus value
+
+      Both look alike, so compare two lines from the practice program:
+
+      ```
+      lea    rax,[rbp-0x10]           ; rax = rbp - 0x10, the ADDRESS of s   (this is &s)
+      mov    edx,DWORD PTR [rbp-0x10] ; edx = the VALUE stored there          (this is s)
+      ```
+
+      `lea` ("load effective address") is how C's `&` shows up. Before a call
+      to `scanf`, `lea` tells you which variable `scanf` will fill in.
+
+  - name: "4. Flags and conditional jumps"
+    type: markdown
+    content: |
+      An `if` in C becomes a `cmp` (or `test`) followed by a **conditional
+      jump**. The two are linked by **flags**: single bits in the `rflags`
+      register that the `cmp` sets and the jump reads.
+
+      ## The four flags that matter
+
+      `cmp a, b` works out `a - b` and sets:
+
+      | Flag | Name | Set to 1 when |
+      |---|---|---|
+      | `ZF` | zero flag | the result is 0, so `a == b` |
+      | `SF` | sign flag | the result's top bit is 1 (it looks negative) |
+      | `CF` | carry flag | the subtraction needed a borrow, so **unsigned** `a < b` |
+      | `OF` | overflow flag | the **signed** result did not fit (wrapped around) |
+
+      gdb's `p $eflags` lists the flags that are 1 by name. What it printed
+      after each of these (real output):
+
+      | Instructions | `p $eflags` printed | Meaning |
+      |---|---|---|
+      | `mov eax, 3` then `cmp eax, 5` | `[ CF AF SF IF ]` | 3 - 5 needed a borrow (`CF`) and is negative (`SF`) |
+      | `test eax, eax` with `eax` = 3 | `[ PF IF ]` | no `ZF`, so `eax` is not zero |
+
+      Ignore `AF`, `PF` and `IF`; compiled code here never uses them.
+
+      ## The jumps
+
+      There are two families, and **which family the compiler picks depends on
+      whether the C variable is signed or unsigned**:
+
+      | C condition | signed (`int`) | unsigned (`unsigned int`, pointers) |
+      |---|---|---|
+      | `a == b` | `je` (jump if equal) | `je` |
+      | `a != b` | `jne` (jump if not equal) | `jne` |
+      | `a < b` | `jl` (less) | `jb` (below) |
+      | `a <= b` | `jle` (less or equal) | `jbe` (below or equal) |
+      | `a > b` | `jg` (greater) | `ja` (above) |
+      | `a >= b` | `jge` (greater or equal) | `jae` (above or equal) |
+
+      Memory aid: **less / greater = signed**, **below / above = unsigned**.
+      You may also see `jz` (same as `je`) and `jnz` (same as `jne`). An `n` after
+      the `j` means "not".
+
+      ## Why signed and unsigned give different answers
+
+      We ran `mov eax, -1` then `cmp eax, 1`. `p $eflags` printed
+      `[ SF IF ]`: `SF` is 1, while `CF`, `OF` and `ZF` are 0.
+
+      The bits in `eax` are `0xffffffff`.
+
+      - As a **signed** number that is -1, and -1 < 1, so `jl` **jumps**.
+        (`jl` jumps when `SF` and `OF` differ: here 1 and 0.)
+      - As an **unsigned** number that is 4294967295, which is above 1, so `ja`
+        **jumps** and `jb` does not. (`ja` jumps when `CF` and `ZF` are both 0;
+        `jb` jumps when `CF` is 1.)
+
+      Same bits, same `cmp`, opposite answers. The jump decides how to read the
+      number. When you work out what input a check wants, first look at which
+      family the jump belongs to.
+
+      ## The compiler often flips the condition
+
+      Here is the same `if` on a signed and on an unsigned number, compiled at
+      `-O0` (real objdump output; the left column is the address):
+
+      ```c
+      int small_signed(int x)            { if (x < 10) return 1; return 0; }
+      int small_unsigned(unsigned int x) { if (x < 10) return 1; return 0; }
+      ```
+
+      ```
+      <small_signed>:
+         8:  mov    DWORD PTR [rbp-0x4],edi
+         b:  cmp    DWORD PTR [rbp-0x4],0x9
+         f:  jg     18 <small_signed+0x18>     ; if x > 9, skip the "then" part
+        11:  mov    eax,0x1                    ; then: return 1
+        16:  jmp    1d <small_signed+0x1d>
+        18:  mov    eax,0x0                    ; else: return 0
+        1d:  pop    rbp
+
+      <small_unsigned>:
+        2a:  cmp    DWORD PTR [rbp-0x4],0x9
+        2e:  ja     37 <small_unsigned+0x18>   ; same shape, but "above" instead of "greater"
+      ```
+
+      Two lessons in five lines:
+
+      1. The C said `x < 10`. The assembly says "jump **away** if `x > 9`". The
+         compiler writes the jump that **skips** the `if` body, so the condition
+         in the assembly is the opposite of the one in C. Read every
+         conditional jump as "when do we leave?"
+      2. `x < 10` and `x <= 9` are the same test for whole numbers, and the
+         compiler picked the constant `9`. Off-by-one confusion about edge
+         values is the most common mistake on checks like these. Test the edge
+         values by running the program.
+
+      ## A worked reading
+
+      ```
+      cmp    eax,0x50
+      jbe    <fail>
+      ```
+
+      "Compare `eax` with 0x50 (80). If `eax` is below or equal to 80, treating
+      it as unsigned, go to `fail`." So to get past this line you need
+      `eax > 80`, which means at least 81.
+
+  - name: "5. The stack and stack frames"
+    type: markdown
+    content: |
+      ## The stack
+
+      The **stack** is a region of memory that every function uses for its
+      local variables and for remembering where to return. It works like a pile
+      of plates: you add (**push**) to the top and remove (**pop**) from the top.
+
+      Two facts confuse everyone at first:
+
+      1. **The stack grows towards lower addresses.** "The top" of the stack is
+         its lowest address. Pushing makes `rsp` smaller.
+      2. **`rsp` always points at the top item** (the most recently pushed one).
+
+      ```
+      before push rdx          after push rdx (rsp went down by 8)
+
+      higher addresses         higher addresses
+      +--------------+         +--------------+
+      |  older data  |         |  older data  |
+      +--------------+         +--------------+
+      |  older data  | <- rsp  |  older data  |
+      +--------------+         +--------------+
+      |  (free)      |         |  value of rdx| <- rsp
+      +--------------+         +--------------+
+      lower addresses          lower addresses
+      ```
+
+      `pop` does the reverse: read 8 bytes at `rsp`, then add 8 to `rsp`.
+
+      ## `call` and `ret`
+
+      `call mix` does two things: push the address of the instruction right
+      after the `call` (the **return address**), then jump to `mix`. `ret` pops
+      that address back into `rip`, so the program continues where it left off.
+
+      We stopped the practice program at the very first instruction of `mix`
+      and looked at the top of the stack (real gdb output):
+
+      ```
+      (gdb) x/gx $rsp
+      0x7fffffffebc8: 0x00000000004011d3
+      ```
+
+      `0x4011d3` is exactly the address of the line after `call mix` in `main`:
+
+      ```
+        4011ce:       e8 63 ff ff ff          call   401136 <mix>
+        4011d3:       89 45 f4                mov    DWORD PTR [rbp-0xc],eax
+      ```
+
+      If something overwrites that saved return address, `ret` jumps wherever
+      the attacker wants. That is the heart of stack buffer overflows, which
+      you will meet in a later module.
+
+      ## Stack frames
+
+      A **stack frame** is the part of the stack that belongs to one running
+      function. Each function sets up its frame with the same three lines at
+      the start (the **prologue**):
+
+      ```
+      push   rbp          ; save the caller's rbp on the stack
+      mov    rbp,rsp      ; rbp now marks this function's frame
+      sub    rsp,0x10     ; reserve 0x10 bytes below it for local variables
+      ```
+
+      and takes it down at the end (the **epilogue**):
+
+      ```
+      leave               ; rsp = rbp, then pop rbp  (restores the caller's rbp)
+      ret                 ; pop the return address and go back
+      ```
+
+      (`mix` has no `sub rsp` and ends with `pop rbp` instead of `leave`.
+      Functions that call nobody else are allowed to use the space right below
+      `rsp` without reserving it. This is called the **red zone**. `main`
+      calls other functions, so it reserves its space.)
+
+      While the function runs, `rbp` stays fixed, so the compiler names every
+      local variable by its distance from `rbp`: `[rbp-0x4]`, `[rbp-0x14]`, and
+      so on. **`[rbp-0x14]` means "the memory 0x14 (20) bytes below the
+      address in `rbp`".**
+
+      ## The real frames of `main` and `mix`
+
+      These addresses and values come from gdb runs of the practice program
+      (gdb turns off address randomisation, so the addresses were the same each
+      time), stopped inside `mix` after it stored its arguments. Your
+      addresses may differ; the layout will not.
+
+      ```
+      address           value                      what it is
+                                                   higher addresses
+                        ...
+      0x7fffffffebe8    0x00007ffff7dd01ca         main's return address (into the C library)
+      0x7fffffffebe0    0x00007fffffffec80         rbp saved by main's prologue   <- main's rbp
+      0x7fffffffebd8    0x1122334455667788         big    = main's [rbp-0x8]   (8 bytes)
+      0x7fffffffebd4    (not set yet)              m      = main's [rbp-0xc]   (4 bytes)
+      0x7fffffffebd0    (not set yet)              s      = main's [rbp-0x10]  (4 bytes)
+      ------------------------------------------------------- main's frame ends here
+      0x7fffffffebc8    0x00000000004011d3         return address pushed by "call mix"
+      0x7fffffffebc0    0x00007fffffffebe0         main's rbp, saved by mix   <- mix's rbp (and rsp)
+      0x7fffffffebbc    (set a few steps later)    t = mix's [rbp-0x4]
+                        ...
+      0x7fffffffebac    5                          a = mix's [rbp-0x14]
+      0x7fffffffeba8    7                          b = mix's [rbp-0x18]
+                                                   lower addresses
+      ```
+
+      Read it from the top down, which is the order things happened:
+      `main` set up its frame, `call mix` pushed the return address, `mix`
+      pushed `main`'s `rbp` and set its own `rbp` to that spot, then stored its
+      arguments and local below it.
+
+      Inside any function compiled like this:
+
+      | Location | Holds |
+      |---|---|
+      | `[rbp+0x8]` | the return address |
+      | `[rbp]` | the caller's saved `rbp` |
+      | `[rbp-something]` | this function's local variables and copies of its arguments |
+
+      ## Arrays on the stack
+
+      An array is stored as one block. **Element 0 has the lowest address**, and
+      each later element sits higher. For an `int` array each element is 4 bytes,
+      so element `n` is `4*n` bytes above element 0. Suppose a function's
+      `int v[4]` starts at `[rbp-0x50]` (an invented example, not from a
+      challenge):
+
+      ```
+      [rbp-0x44]   v[3]    = start + 3*4      higher addresses
+      [rbp-0x48]   v[2]    = start + 2*4
+      [rbp-0x4c]   v[1]    = start + 1*4
+      [rbp-0x50]   v[0]    = start            lower addresses
+      ```
+
+      To find which element a slot is, take the distance from `v[0]` and divide
+      by 4. For `[rbp-0x48]`: 0x50 - 0x48 = 8 bytes, and 8 / 4 = element 2
+      (counting from 0). To index an array, compiled code often does
+      `movsxd rdx, edx` (widen the index to 64 bits), `shl rdx, 0x2` (multiply
+      by 4) and `add rax, rdx` (add to the start address).
+
+  - name: "6. The calling convention: how functions get arguments"
+    type: markdown
+    content: |
+      The caller and the function it calls must agree where the arguments go.
+      On 64-bit Linux that agreement is the **System V calling convention**:
+
+      | Argument | 1st | 2nd | 3rd | 4th | 5th | 6th | Return value |
+      |---|---|---|---|---|---|---|---|
+      | 64-bit register | `rdi` | `rsi` | `rdx` | `rcx` | `r8` | `r9` | `rax` |
+      | 32-bit name (for `int`) | `edi` | `esi` | `edx` | `ecx` | `r8d` | `r9d` | `eax` |
+
+      A memory aid: **"Diane's silk dress costs 89 dollars"**: `di`, `si`, `dx`,
+      `cx`, `8`, `9`. A seventh argument and beyond go on the stack; you will not
+      need that here.
+
+      ## The caller's side: real code from `main`
+
+      ```
+        4011c4:  mov    esi,0x7          ; 2nd argument b = 7
+        4011c9:  mov    edi,0x5          ; 1st argument a = 5
+        4011ce:  call   401136 <mix>     ; mix(5, 7)
+        4011d3:  mov    DWORD PTR [rbp-0xc],eax   ; m = the return value
+      ```
+
+      Notice that the compiler filled the **2nd** argument first. The order of
+      the `mov` lines means nothing. **The register name** tells you which
+      argument it is. When registers are copied into other registers before a
+      call, follow the copies from top to bottom and read the registers'
+      final contents at the `call`.
+
+      A pointer argument shows up as `lea` (page 3), because C's `&s` is an
+      address:
+
+      ```
+        4011e3:  lea    rax,[rbp-0x10]   ; rax = address of s
+        4011e7:  mov    rdi,rax          ; 1st argument = &s
+        4011ea:  call   40118c <bump>    ; bump(&s)
+      ```
+
+      The call to `printf("%d %d %lx\n", m, s, big)` uses four arguments:
+
+      ```
+        4011ef:  mov    edx,DWORD PTR [rbp-0x10]  ; 3rd: s
+        4011f2:  mov    rcx,QWORD PTR [rbp-0x8]   ; 4th: big (8 bytes, so rcx)
+        4011f6:  mov    eax,DWORD PTR [rbp-0xc]   ; eax = m ...
+        4011f9:  mov    esi,eax                   ; ... 2nd: m (copied through eax)
+        4011fb:  mov    edi,0x402004              ; 1st: address of the text "%d %d %lx\n"
+        401200:  mov    eax,0x0                   ; printf-style functions want al = 0 here
+        401205:  call   401040 <printf@plt>
+      ```
+
+      The `mov eax,0x0` before `printf` is not an argument. Functions that take
+      a variable number of arguments (`printf`, `scanf`) expect `al` to hold
+      the number of floating-point arguments, which is 0 here.
+
+      ## The callee's side: real code from `mix`
+
+      At `-O0`, the first thing a function does after its prologue is copy its
+      argument registers into its own stack slots:
+
+      ```
+        40113e:  mov    DWORD PTR [rbp-0x14],edi  ; a lives at [rbp-0x14] from now on
+        401141:  mov    DWORD PTR [rbp-0x18],esi  ; b lives at [rbp-0x18] from now on
+      ```
+
+      These lines are your decoder ring. Write down "`[rbp-0x14]` = 1st argument,
+      `[rbp-0x18]` = 2nd argument", then every later use of those slots is
+      readable.
+
+      ## Who may overwrite which register
+
+      A called function may freely overwrite `rax`, `rcx`, `rdx`, `rsi`, `rdi`,
+      `r8` to `r11` (**caller-saved**). It must leave `rbx`, `rbp`, `rsp` and
+      `r12` to `r15` as it found them (**callee-saved**). So after any `call`,
+      do not assume `rdi` or `rax` still hold what they held before.
+
+  - name: "7. Byte order: little-endian"
+    type: markdown
+    content: |
+      Memory is a long row of bytes, each with its own address. A number bigger
+      than one byte uses several neighbouring bytes. **Endianness** is the
+      order of those bytes. x86-64 is **little-endian**: the **least**
+      significant byte (the "little end", the rightmost two hex digits) goes at
+      the **lowest** address.
+
+      The practice program stores `long big = 0x1122334455667788;` in 8 bytes:
+
+      ```
+      the number:   0x 11 22 33 44 55 66 77 88
+                       |  |  |  |  |  |  |  |
+                       |  |  |  |  |  |  |  +--> lowest address  (+0)
+                       |  |  |  |  |  |  +-----> +1
+                       |  |  |  |  |  +--------> +2
+                       |  |  |  |  +-----------> +3
+                       |  |  |  +--------------> +4
+                       |  |  +-----------------> +5
+                       |  +--------------------> +6
+                       +-----------------------> highest address (+7)
+
+      memory, lowest address first:
+
+      address:  +0   +1   +2   +3   +4   +5   +6   +7
+              +----+----+----+----+----+----+----+----+
+      byte:   | 88 | 77 | 66 | 55 | 44 | 33 | 22 | 11 |
+              +----+----+----+----+----+----+----+----+
+      ```
+
+      ## See it in gdb (real output)
+
+      Ask gdb for the same 8 bytes two ways:
+
+      ```
+      (gdb) x/8xb $rbp-0x8
+      0x7fffffffebd8: 0x88    0x77    0x66    0x55    0x44    0x33    0x22    0x11
+      (gdb) x/gx $rbp-0x8
+      0x7fffffffebd8: 0x1122334455667788
+      ```
+
+      - `x/8xb` shows **8 single bytes** in memory order, lowest address first.
+        The number looks backwards.
+      - `x/gx` shows **one 8-byte value**. gdb puts the bytes back in the right
+        order for you, so you see the real number.
+
+      Neither is wrong. They are two views of the same memory. Whenever you read
+      a number from a byte-by-byte view (`x/..xb`, `objdump -s`, a hex dump,
+      `xxd`), reverse the bytes.
+
+      ## See it in objdump (real output)
+
+      Numbers written inside instructions are stored little-endian too:
+
+      ```
+        4011b6:       48 b8 88 77 66 55 44    movabs rax,0x1122334455667788
+        4011bd:       33 22 11
+        4011fb:       bf 04 20 40 00          mov    edi,0x402004
+      ```
+
+      After the instruction's own code (`48 b8`, `bf`) come the number's bytes,
+      little end first: `88 77 66 ...` and `04 20 40 00`.
+
+      ## Converting in Python
+
+      ```
+      >>> hex(int.from_bytes(bytes.fromhex("8877665544332211"), "little"))
+      '0x1122334455667788'
+      >>> (0x1122334455667788).to_bytes(8, "little").hex()
+      '8877665544332211'
+      ```
+
+      pwntools (installed in the dojo) has the same as `u64(...)` and `p64(...)`.
+
+      **Only the order of the bytes flips, never the two hex digits inside a
+      byte.** `0x12ab` is stored as the bytes `ab 12`. Reading that back, you
+      reverse the bytes to get `12 ab`, which is `0x12ab`. Reversing digit by
+      digit (`ba21`) is wrong. Work in whole bytes, two hex digits at a time.
+
+  - name: "8. Loops"
+    type: markdown
+    content: |
+      Assembly has no `for` or `while`. A loop is a conditional jump that goes
+      **backwards** to an earlier address. If you see a jump whose target
+      address is lower than its own address, you have found a loop.
+
+      ## The shape `gcc -O0` uses for a `for` loop
+
+      ```
+              set up           (i = 1)
+              jmp CHECK        (test before the first round)
+      BODY:   the loop body    (total += i)
+              the step         (i++)
+      CHECK:  cmp i, n
+              jle BODY         (jump BACK while i <= n)
+              after the loop
+      ```
+
+      The check sits at the bottom, and the first `jmp` skips down to it. That
+      way a loop that should run zero times runs zero times.
+
+      ## Real output: `sum_to`
+
+      ```c
+      int sum_to(int n) {
+          int total = 0;
+          for (int i = 1; i <= n; i++) {
+              total += i;
+          }
+          return total;
+      }
+      ```
+
+      ```
+      000000000040115a <sum_to>:
+        40115a:  endbr64
+        40115e:  push   rbp
+        40115f:  mov    rbp,rsp
+        401162:  mov    DWORD PTR [rbp-0x14],edi    ; n = 1st argument
+        401165:  mov    DWORD PTR [rbp-0x4],0x0     ; total = 0
+        40116c:  mov    DWORD PTR [rbp-0x8],0x1     ; i = 1
+        401173:  jmp    40117f <sum_to+0x25>        ; go to the check
+        401175:  mov    eax,DWORD PTR [rbp-0x8]     ; BODY: eax = i
+        401178:  add    DWORD PTR [rbp-0x4],eax     ;       total += i
+        40117b:  add    DWORD PTR [rbp-0x8],0x1     ; STEP: i++
+        40117f:  mov    eax,DWORD PTR [rbp-0x8]     ; CHECK: eax = i
+        401182:  cmp    eax,DWORD PTR [rbp-0x14]    ;        compare i with n
+        401185:  jle    401175 <sum_to+0x1b>        ;        i <= n (signed)? back to BODY
+        401187:  mov    eax,DWORD PTR [rbp-0x4]     ; return total
+        40118a:  pop    rbp
+        40118b:  ret
+      ```
+
+      How to pick out the pieces in any loop:
+
+      - **The backward jump** is `jle 401175` at `401185`: 0x401175 is lower
+        than 0x401185. Everything from 0x401175 to the jump is the loop.
+      - **The counter** is the slot that goes up by a fixed amount each round
+        (`add DWORD PTR [rbp-0x8],0x1`) and is compared at the bottom.
+      - **The accumulator** is the slot that collects a result (`total`, here
+        `[rbp-0x4]`). Its starting value is the `mov` into it before the loop.
+      - **The number of rounds** comes from the `cmp` and the jump's family:
+        `jle` keeps going while `i <= n`.
+
+      ## Watch it run (real gdb output)
+
+      We put a breakpoint on the `cmp` at 0x401182 and printed two `int`s
+      starting at `[rbp-0x8]` each time it stopped. `x/2dw` means "2 values,
+      decimal, 4 bytes each"; the first is `i` at `[rbp-0x8]`, the second is
+      `total` at `[rbp-0x4]`, the next 4 bytes up:
+
+      ```
+      (gdb) break *0x401182
+      Breakpoint 2 at 0x401182
+      (gdb) continue
+      Breakpoint 2, 0x0000000000401182 in sum_to ()
+      (gdb) x/2dw $rbp-0x8
+      0x7fffffffebb8: 1       0
+      ```
+
+      We repeated `continue` and `x/2dw $rbp-0x8` four more times. The `x`
+      lines printed were:
+
+      ```
+      0x7fffffffebb8: 2       1
+      0x7fffffffebb8: 3       3
+      0x7fffffffebb8: 4       6
+      0x7fffffffebb8: 5       10
+      ```
+
+      On the last stop `i` is 5, which is not `<= 4`, so `jle` falls through
+      and the function returns 10. (`main` then calls `bump(&s)`, which is why
+      the program prints 11.)
+
+      When a loop's recipe is hard to do by hand, copy it into Python, one line
+      per instruction, and let Python run the rounds. Keep 32-bit wrap-around
+      with `& 0xffffffff` after each step.
+
+  - name: "9. Worked example: from C to objdump to gdb"
+    type: markdown
+    content: |
+      This page takes the practice program from page 1 through the full
+      process you will use on every challenge: read the whole thing in
+      objdump, then confirm your reading in gdb. Every output below is real;
+      only the `;` comments were added.
+
+      ## Step 1: compile and run
+
+      ```
+      $ gcc -O0 -fno-stack-protector -no-pie -fno-pie -o toy toy.c
+      $ ./toy
+      130 11 1122334455667788
+      ```
+
+      `-no-pie` makes the program load at the same addresses every time, so the
+      addresses in objdump are the ones you will see in gdb. The challenges are
+      built the same way.
+
+      ## Step 2: disassemble
+
+      ```
+      $ objdump -d -M intel toy | more
+      ```
+
+      `more` shows one screen at a time: Space for the next screen, `q` to
+      quit. Type `/<main>:` and press Enter to jump to `main`. (Or print only
+      `main`: `objdump -d -M intel --disassemble=main toy`.) Here it is:
+
+      ```
+      00000000004011aa <main>:
+        4011aa:       f3 0f 1e fa             endbr64
+        4011ae:       55                      push   rbp
+        4011af:       48 89 e5                mov    rbp,rsp
+        4011b2:       48 83 ec 10             sub    rsp,0x10
+        4011b6:       48 b8 88 77 66 55 44    movabs rax,0x1122334455667788
+        4011bd:       33 22 11
+        4011c0:       48 89 45 f8             mov    QWORD PTR [rbp-0x8],rax
+        4011c4:       be 07 00 00 00          mov    esi,0x7
+        4011c9:       bf 05 00 00 00          mov    edi,0x5
+        4011ce:       e8 63 ff ff ff          call   401136 <mix>
+        4011d3:       89 45 f4                mov    DWORD PTR [rbp-0xc],eax
+        4011d6:       bf 04 00 00 00          mov    edi,0x4
+        4011db:       e8 7a ff ff ff          call   40115a <sum_to>
+        4011e0:       89 45 f0                mov    DWORD PTR [rbp-0x10],eax
+        4011e3:       48 8d 45 f0             lea    rax,[rbp-0x10]
+        4011e7:       48 89 c7                mov    rdi,rax
+        4011ea:       e8 9d ff ff ff          call   40118c <bump>
+        4011ef:       8b 55 f0                mov    edx,DWORD PTR [rbp-0x10]
+        4011f2:       48 8b 4d f8             mov    rcx,QWORD PTR [rbp-0x8]
+        4011f6:       8b 45 f4                mov    eax,DWORD PTR [rbp-0xc]
+        4011f9:       89 c6                   mov    esi,eax
+        4011fb:       bf 04 20 40 00          mov    edi,0x402004
+        401200:       b8 00 00 00 00          mov    eax,0x0
+        401205:       e8 36 fe ff ff          call   401040 <printf@plt>
+        40120a:       b8 00 00 00 00          mov    eax,0x0
+        40120f:       c9                      leave
+        401210:       c3                      ret
+      ```
+
+      ## Step 3: walk `main` line by line
+
+      | Address | Instruction | Meaning | C |
+      |---|---|---|---|
+      | 4011aa | `endbr64` | function-start marker; skip it | |
+      | 4011ae-4011b2 | `push rbp` / `mov rbp,rsp` / `sub rsp,0x10` | prologue: new frame with 0x10 bytes for locals | `{` |
+      | 4011b6 | `movabs rax,0x1122334455667788` | put the 8-byte constant in `rax` (this instruction's bytes wrap onto the next line) | |
+      | 4011c0 | `mov QWORD PTR [rbp-0x8],rax` | store it in an 8-byte local | `long big = 0x1122...;` |
+      | 4011c4 | `mov esi,0x7` | 2nd argument = 7 | |
+      | 4011c9 | `mov edi,0x5` | 1st argument = 5 | |
+      | 4011ce | `call 401136 <mix>` | call `mix` | `mix(5, 7)` |
+      | 4011d3 | `mov DWORD PTR [rbp-0xc],eax` | save the return value in a 4-byte local | `int m = ...;` |
+      | 4011d6 | `mov edi,0x4` | 1st argument = 4 | |
+      | 4011db | `call 40115a <sum_to>` | call `sum_to` | `sum_to(4)` |
+      | 4011e0 | `mov DWORD PTR [rbp-0x10],eax` | save the return value | `int s = ...;` |
+      | 4011e3 | `lea rax,[rbp-0x10]` | `rax` = the **address** of `s` | `&s` |
+      | 4011e7 | `mov rdi,rax` | 1st argument = that address | |
+      | 4011ea | `call 40118c <bump>` | call `bump` | `bump(&s);` |
+      | 4011ef-401200 | five `mov`s | load the `printf` arguments (page 6) | |
+      | 401205 | `call 401040 <printf@plt>` | call `printf` from the C library | `printf(...)` |
+      | 40120a | `mov eax,0x0` | return value 0 | `return 0;` |
+      | 40120f-401210 | `leave` / `ret` | epilogue | `}` |
+
+      From the stores you can now name every local:
+
+      ```
+      [rbp-0x8]   8 bytes   big
+      [rbp-0xc]   4 bytes   m   (return value of mix)
+      [rbp-0x10]  4 bytes   s   (return value of sum_to, then bumped)
+      ```
+
+      What is at `0x402004`? It is an address, passed as the first argument to
+      `printf`, so it is probably the format text. gdb confirms it in step 4.
+
+      ## Step 4: confirm in gdb
+
+      Start the debugger with `gdb ./toy`. In the dojo, gdb loads **pwndbg**,
+      so the prompt reads `pwndbg>` and every stop also prints a large panel of
+      registers, code and stack. The commands below work the same. This
+      transcript was taken with plain gdb to keep it short. Lines after
+      `(gdb)` are what we typed; everything else is gdb's answer, copied
+      as printed except for two trims: the two `Thread debugging ...` lines
+      gdb prints after `run` are left out, and so are some repeated lines
+      after `stepi` (we say where). Stack addresses (`0x7fff...`) may differ on
+      your machine; code addresses (`0x401...`) will not.
+
+      **Stop at the first instruction of `mix` and look at the arguments.**
+
+      ```
+      (gdb) break *mix
+      Breakpoint 1 at 0x401136
+      (gdb) run
+      Breakpoint 1, 0x0000000000401136 in mix ()
+      (gdb) info registers rdi rsi rsp rbp rip
+      rdi            0x5                 5
+      rsi            0x7                 7
+      rsp            0x7fffffffebc8      0x7fffffffebc8
+      rbp            0x7fffffffebe0      0x7fffffffebe0
+      rip            0x401136            0x401136 <mix>
+      (gdb) x/gx $rsp
+      0x7fffffffebc8: 0x00000000004011d3
+      ```
+
+      `rdi` = 5 and `rsi` = 7: the calling convention in action. `rip` is at the
+      start of `mix`. The 8 bytes at the top of the stack are the return
+      address, `0x4011d3`, the line after `call mix` in `main`.
+
+      The `*` in `break *mix` means "the exact address". Without the `*`,
+      `break mix` stops a few instructions later, after the prologue
+      (real output: `break mix` gave `Breakpoint 1 at 0x40113e`).
+
+      **Step through the prologue one instruction at a time.** `display/i $pc`
+      tells gdb to print the next instruction after every step. `stepi`
+      (short: `si`) runs exactly one instruction.
+
+      ```
+      (gdb) display/i $pc
+      (gdb) stepi
+      0x000000000040113a in mix ()
+      1: x/i $pc
+      => 0x40113a <mix+4>:    push   rbp
+      (gdb) stepi
+      0x000000000040113b in mix ()
+      1: x/i $pc
+      => 0x40113b <mix+5>:    mov    rbp,rsp
+      (gdb) info registers rsp rbp
+      rsp            0x7fffffffebc0      0x7fffffffebc0
+      rbp            0x7fffffffebe0      0x7fffffffebe0
+      (gdb) x/2gx $rsp
+      0x7fffffffebc0: 0x00007fffffffebe0      0x00000000004011d3
+      ```
+
+      **The `=>` line is the instruction about to run, not the one that ran
+      last.** After the second `stepi`, `push rbp` has run: `rsp` dropped by 8
+      (from `...ebc8` to `...ebc0`), and the top of the stack now holds the old
+      `rbp` (`0x7fffffffebe0`), with the return address right above it.
+
+      **Watch the arguments land in their slots.** From here on, the
+      `0x... in mix ()` and `1: x/i $pc` lines that gdb prints after each
+      `stepi` are left out; only the `=>` line is kept.
+
+      ```
+      (gdb) stepi
+      => 0x40113e <mix+8>:    mov    DWORD PTR [rbp-0x14],edi
+      (gdb) stepi
+      => 0x401141 <mix+11>:   mov    DWORD PTR [rbp-0x18],esi
+      (gdb) stepi
+      => 0x401144 <mix+14>:   mov    eax,DWORD PTR [rbp-0x14]
+      (gdb) x/2wx $rbp-0x18
+      0x7fffffffeba8: 0x00000007      0x00000005
+      ```
+
+      `x/2wx $rbp-0x18` reads two 4-byte values starting at `rbp-0x18`: `b` = 7
+      at `[rbp-0x18]`, then `a` = 5 four bytes higher at `[rbp-0x14]`.
+
+      **Watch the math.**
+
+      ```
+      (gdb) stepi
+      => 0x401147 <mix+17>:   imul   eax,DWORD PTR [rbp-0x18]
+      (gdb) stepi
+      => 0x40114b <mix+21>:   mov    DWORD PTR [rbp-0x4],eax
+      (gdb) info registers rax
+      rax            0x23                35
+      (gdb) stepi
+      => 0x40114e <mix+24>:   add    DWORD PTR [rbp-0x4],0x64
+      (gdb) stepi
+      => 0x401152 <mix+28>:   mov    eax,DWORD PTR [rbp-0x4]
+      (gdb) x/wx $rbp-0x4
+      0x7fffffffebbc: 0x00000087
+      (gdb) stepi
+      => 0x401155 <mix+31>:   sub    eax,DWORD PTR [rbp-0x14]
+      (gdb) stepi
+      => 0x401158 <mix+34>:   pop    rbp
+      (gdb) info registers rax
+      rax            0x82                130
+      ```
+
+      5 * 7 = 35 = 0x23. 35 + 100 = 135 = 0x87, stored in `t`. 135 - 5 = 130 =
+      0x82 in `eax`, the return value. Each number matches the C.
+
+      **Return to `main`.**
+
+      ```
+      (gdb) stepi
+      => 0x401159 <mix+35>:   ret
+      (gdb) stepi
+      0x00000000004011d3 in main ()
+      => 0x4011d3 <main+41>:  mov    DWORD PTR [rbp-0xc],eax
+      (gdb) info registers rip rax
+      rip            0x4011d3            0x4011d3 <main+41>
+      rax            0x82                130
+      ```
+
+      Here we kept gdb's location line (`0x00000000004011d3 in main ()`),
+      because it now names a different function. `ret` took the return address
+      off the stack and put it in `rip`. We are back in `main`, one line after
+      the `call`, with the answer in `rax`.
+
+      **Look at `main`'s memory.**
+
+      ```
+      (gdb) x/8xb $rbp-0x8
+      0x7fffffffebd8: 0x88    0x77    0x66    0x55    0x44    0x33    0x22    0x11
+      (gdb) x/gx $rbp-0x8
+      0x7fffffffebd8: 0x1122334455667788
+      (gdb) x/s 0x402004
+      0x402004:       "%d %d %lx\n"
+      ```
+
+      `big`, byte by byte and then as one number (page 7), and the guess from
+      step 3 confirmed: `0x402004` holds the format text.
+
+      ## The method, in one list
+
+      1. Run the program once to see what it asks for.
+      2. `objdump -d -M intel` and find `<main>:`. Skip the setup calls at the
+         top that have nothing to do with your input.
+      3. Name the stack slots: where arguments are stored, where `scanf`
+         writes (the `lea` before it), what each `mov` into a slot means.
+      4. Translate the interesting part to C or Python, one line per
+         instruction.
+      5. Check your reading in gdb: break before the interesting part, `stepi`,
+         and compare registers and memory with what you expected.
+
+  - name: "10. How to read objdump and gdb output"
+    type: markdown
+    content: |
+      ## objdump -d -M intel
+
+      ```
+      $ objdump -d -M intel /challenge/<name> | more
+      $ objdump -d -M intel --disassemble=main /challenge/<name>
+      ```
+
+      `-d` means disassemble the code. `-M intel` picks Intel syntax.
+      `| more` shows the output one screen at a time (Space: next screen,
+      `/text` then Enter: search, `q`: quit). `--disassemble=main` prints only
+      the function you name, which is often short enough to need no paging.
+      To keep a copy you can search in an editor, save it:
+      `objdump -d -M intel /challenge/<name> > ~/dis.txt`, then `nano ~/dis.txt`.
+
+      The top of the output looks like this (real output from the practice
+      program):
+
+      ```
+      toy:     file format elf64-x86-64      <- the file and its type (64-bit Linux ELF)
+
+      Disassembly of section .init:          <- a section: a named part of the file
+
+      0000000000401000 <_init>:              <- a function: its start address and <name>
+      ```
+
+      Every function is listed: `_init`, `_start`, and other helper code the
+      compiler adds. You can ignore all of those. Search for `<main>:` and read
+      from there, plus any function `main` calls whose name you do not
+      recognise from the C library.
+
+      **Each instruction line has three columns:**
+
+      ```
+        40114e:       83 45 fc 64             add    DWORD PTR [rbp-0x4],0x64
+        |______|      |_________|             |____________________________|
+         address     machine-code bytes             the instruction
+                     (what the CPU reads)        (mnemonic, then operands:
+                                                  destination, then source)
+      ```
+
+      - **Address** (hex): where this instruction sits in memory. Use it with
+        gdb (`break *0x40114e`).
+      - **Bytes**: the machine code itself. You can usually ignore them, except
+        that numbers inside them are little-endian (`64` here is the `0x64`).
+        A long instruction can spill onto a second line that has an address and
+        bytes but no instruction text:
+
+        ```
+          4011b6:       48 b8 88 77 66 55 44    movabs rax,0x1122334455667788
+          4011bd:       33 22 11
+        ```
+
+      - **Instruction**: the part you read.
+
+      **Extra hints objdump adds:**
+
+      | You see | Meaning |
+      |---|---|
+      | `jmp 40117f <sum_to+0x25>` | target address, and that address written as "0x25 bytes into `sum_to`" |
+      | `call 401040 <printf@plt>` | a call into a shared library function (`printf`). `@plt` is the stub that finds it at run time. |
+      | `mov rax,QWORD PTR [rip+0x2d41]        # 404068 <stdout@GLIBC_2.2.5>` | after `#` objdump has worked out the real address (`404068`) and its name. Here: the global variable `stdout`. |
+      | `__isoc99_scanf` | the C library's name for `scanf` |
+
+      **Dumping data, not code:**
+
+      ```
+      $ objdump -s -j .rodata /challenge/<name>
+      ```
+
+      prints the read-only data section (constant numbers and text) as rows:
+      the address of the row's first byte, then 16 bytes in hex, then the same
+      bytes as text. Bytes are in memory order, so multi-byte numbers appear
+      reversed (page 7).
+
+      ## What `[rbp-0x10]` means, once more
+
+      - `rbp` holds an address (the current frame).
+      - `rbp-0x10` is the address 16 bytes lower.
+      - `[...]` means the memory at that address.
+      - `DWORD PTR` in front means 4 bytes of it.
+
+      So `mov eax, DWORD PTR [rbp-0x10]` = "read the 4-byte local variable 16
+      bytes below `rbp` into `eax`". Two instructions that use the same
+      `[rbp-0x10]` are using the same variable.
+
+      ## gdb commands you need
+
+      | Command | Short | What it does |
+      |---|---|---|
+      | `gdb /challenge/<name>` | | start gdb on a program (it does not run yet) |
+      | `break main` | `b main` | stop when `main` starts (after its prologue) |
+      | `break *0x401182` | `b *0x401182` | stop at that exact address |
+      | `run` | `r` | start the program. Type any input it asks for. |
+      | `stepi` | `si` | run one instruction; follows into calls |
+      | `nexti` | `ni` | run one instruction; runs a whole `call` without stopping inside |
+      | `continue` | `c` | run until the next breakpoint |
+      | `finish` | | run until the current function returns |
+      | `info registers` | `i r` | show all registers; `i r rax rdi` shows only those |
+      | `p/x $rax` | | print one register in hex (`p/d` for decimal) |
+      | `x/5i $rip` | | show the next 5 instructions |
+      | `x/8gx $rsp` | | show 8 values of 8 bytes, starting at the top of the stack |
+      | `disassemble` | | show the whole current function, with `=>` at the next instruction |
+      | `display/i $pc` | | print the next instruction after every step |
+      | `set disassembly-flavor intel` | | Intel syntax in plain gdb (pwndbg already uses it) |
+      | `quit` | `q` | leave gdb |
+
+      Register names in gdb start with `$`: `$rax`, `$rsp`, `$rip`. `$pc`
+      ("program counter") is another name for `$rip`.
+
+      **`break main` versus `break *main`.** Real output from the practice
+      program, where `main` starts at `0x4011aa`:
+
+      ```
+      (gdb) break main
+      Breakpoint 3 at 0x4011b2
+      ```
+
+      `break main` stops 8 bytes in, after `push rbp` and `mov rbp,rsp`, so
+      `rbp` is already set up. `break *main` stops on the very first byte.
+
+      ## Reading `info registers`
+
+      ```
+      rax            0x82                130
+      rsp            0x7fffffffebc0      0x7fffffffebc0
+      rip            0x4011d3            0x4011d3 <main+41>
+      eflags         0x246               [ PF ZF IF ]
+      ```
+
+      Three columns: the register, its value in hex, and the same value in a
+      "natural" form: decimal for data registers, an address (with the
+      function name if there is one) for `rsp`/`rip`, and the list of flags
+      that are 1 for `eflags`.
+
+      ## Reading `x`
+
+      `x` means "examine memory". Its shape is `x/NFU ADDRESS`:
+
+      ```
+      x / 8  g  x   $rsp
+          |  |  |    +-- where to start (a number, a register, or math like $rbp-0x8)
+          |  |  +------- F, format: x hex, d decimal, u unsigned, s text, i instructions, c character
+          |  +---------- U, unit size: b 1 byte, h 2 bytes, w 4 bytes, g 8 bytes
+          +------------- N, how many units
+      ```
+
+      Real output of `x/8gx $rsp`, stopped at `break main` in the practice
+      program:
+
+      ```
+      0x7fffffffebe0: 0x00007fffffffec80      0x00007ffff7dd01ca
+      0x7fffffffebf0: 0x00007fffffffec30      0x00007fffffffed08
+      0x7fffffffec00: 0x0000000100400040      0x00000000004011aa
+      0x7fffffffec10: 0x00007fffffffed08      0xecfe9c7ed3e60407
+      ```
+
+      - The left column is the address of the **first** value on that row.
+      - Each `g` value is 8 bytes, so each row covers 16 bytes and the next
+        row's address is 0x10 higher. The second value on the first row is at
+        `0x7fffffffebe8`.
+      - Here, at the start of `main` (`rsp` = `rbp`): the first value is the
+        saved `rbp`, the second is `main`'s return address into the C library.
+        The others belong to the code that called `main`; you can ignore them.
+        (The very last value changed on every run we tried.)
+
+      The unit changes what you see. `x/8xb` shows bytes in memory order;
+      `x/2wx` and `x/gx` put each unit's bytes back together into a number
+      (page 7). Pick the unit that matches the variable: `w` for an `int`, `g`
+      for a `long` or pointer.
+
+      Addresses on the stack (`0x7fff...`) will differ on your machine. Code
+      addresses (`0x401...`) will match objdump.
+
+  - name: "11. Glossary"
+    type: markdown
+    content: |
+      | Term | Meaning |
+      |---|---|
+      | **accumulator** | a variable a loop keeps updating to build a result |
+      | **address** | the number that says where a byte is in memory |
+      | **assembly** | the readable text form of machine instructions |
+      | **AT&T syntax** | the other way of writing x86 assembly: source first, `%` before registers. objdump's default. |
+      | **base pointer (`rbp`)** | register that marks the current function's stack frame; locals are found at `[rbp-...]` |
+      | **bit** | a single 0 or 1 |
+      | **byte** | 8 bits; two hex digits; the smallest piece of memory with its own address |
+      | **callee / caller** | the function being called / the function doing the calling |
+      | **calling convention** | the agreement about where arguments and return values go (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`; return in `rax`) |
+      | **compiler** | program that turns source code (C) into machine code (`gcc`) |
+      | **conditional jump (`jcc`)** | a jump that happens only if the flags say so (`je`, `jl`, `ja`, ...) |
+      | **counter** | the loop variable that counts rounds (`i`) |
+      | **debugger** | a program that runs another program step by step and lets you look inside (`gdb`) |
+      | **disassembler** | program that turns machine code back into assembly (`objdump`) |
+      | **displacement** | the fixed number in a memory operand, like the `-0x14` in `[rbp-0x14]` |
+      | **DWORD / QWORD** | 4 bytes / 8 bytes ("double word", "quad word"); `WORD` is 2 bytes |
+      | **endianness** | the order of a number's bytes in memory |
+      | **epilogue** | the instructions that take down a stack frame (`leave` or `pop rbp`, then `ret`) |
+      | **flags** | single bits in `rflags` that record facts about the last result (`ZF`, `SF`, `CF`, `OF`) |
+      | **hex** | base 16; digits 0-9 then a-f; written with `0x` in front |
+      | **immediate** | a number written directly in an instruction, like the `0x64` in `add eax,0x64` |
+      | **instruction** | one command for the CPU |
+      | **instruction pointer (`rip`)** | register holding the address of the next instruction |
+      | **Intel syntax** | the way of writing assembly used here: destination first (`mov dst, src`) |
+      | **little-endian** | least significant byte stored at the lowest address; what x86-64 uses |
+      | **machine code** | the bytes the CPU actually runs |
+      | **mnemonic** | an instruction's name, like `mov` or `add` |
+      | **`-O0`** | gcc option for no optimisation: one C line becomes a few plain instructions |
+      | **operand** | one of the things an instruction works on: a register, an immediate, or memory |
+      | **pointer** | a value that is an address of something else |
+      | **pop / push** | take the top value off the stack / put a value on top of it |
+      | **prologue** | the instructions that set up a stack frame (`push rbp; mov rbp,rsp; sub rsp,N`) |
+      | **pwndbg** | an add-on for gdb, installed in the dojo, that shows registers, code and stack at every stop |
+      | **red zone** | 128 bytes below `rsp` that a function which calls nothing may use without moving `rsp` |
+      | **register** | a small, fast storage slot inside the CPU (`rax`, `rdi`, ...) |
+      | **return address** | the address `call` pushes so `ret` knows where to go back to |
+      | **section** | a named part of a program file: `.text` (code), `.rodata` (constants), `.data` (globals) |
+      | **signed / unsigned** | whether a bit pattern is read as possibly negative (two's complement) or never negative |
+      | **stack** | memory region for local variables and return addresses; grows towards lower addresses |
+      | **stack frame** | the part of the stack that belongs to one running function |
+      | **stack pointer (`rsp`)** | register holding the address of the top of the stack |
+      | **two's complement** | the standard way to store negative numbers: -1 is all 1 bits (`0xffffffff` in 32 bits) |
+      | **wrap-around** | a result too big for the register loses its top bits, like an odometer rolling over |
+
+  - name: "12. Common mistakes"
+    type: markdown
+    content: |
+      - **Reading AT&T as Intel.** If you see `%` signs, you left out `-M intel`
+        and every operand pair is reversed.
+      - **Reading `mov a, b` as "a goes to b".** In Intel syntax the
+        **first** operand is the one that changes: `mov eax, 5` is `eax = 5`.
+      - **Mixing hex and decimal.** `0x10` is 16, not 10. Most tools print hex;
+        most programs ask for decimal unless they say otherwise. Convert with
+        `python3 -c 'print(0x10)'` or `hex(16)`.
+      - **Forgetting wrap-around.** 32-bit math keeps only the low 32 bits. In
+        Python add `& 0xffffffff` after every step, not only at the end of
+        a subtraction.
+      - **Treating `eax` and `rax` as different registers.** They are the same
+        register under two names. Writing `eax` also zeroes the top half of
+        `rax`.
+      - **Reading the jump the wrong way round.** At `-O0` the jump usually
+        **skips** the `if` body, so its condition is the opposite of the C.
+        Ask "when does this jump leave?"
+      - **Ignoring signed versus unsigned.** `jl`/`jg` treat numbers as signed,
+        `jb`/`ja` as unsigned. -1 passes `x < 5` as signed and fails it as
+        unsigned.
+      - **Off by one at the edges.** The compiler may write `x < 10` as
+        "`x > 9` fails". Check the edge values by running the program.
+      - **Reading bytes in the wrong order.** In a byte dump (`x/8xb`,
+        `objdump -s`), multi-byte numbers are little-endian. Reverse whole
+        bytes (pairs of hex digits), never single digits.
+      - **Thinking `lea` reads memory.** `lea rax, [rbp-0x10]` puts the
+        **address** `rbp-0x10` in `rax`. Only `mov` with brackets reads the
+        value.
+      - **Guessing argument order from the order of the `mov`s.** The register
+        name tells you the position (`rdi` 1st, `rsi` 2nd, ...), not which
+        `mov` came first.
+      - **Assuming a register survives a `call`.** `rax`, `rdi`, `rsi`, `rdx`,
+        `rcx`, `r8` to `r11` can all be different afterwards.
+      - **Getting lost in setup code.** Each challenge's `main` starts with a
+        few calls that have nothing to do with your input (setting user IDs,
+        printing the prompt, `fflush`). Skip to the first `scanf`.
+      - **Using numbers from someone else's copy.** Each challenge has several
+        versions. Read the numbers from your own `/challenge` binary.
+      - **Confusing "the arrow line" in gdb.** After `stepi`, the `=>` line is
+        the instruction about to run. Its effect is not visible yet.
+      - **Expecting `stepi` and `nexti` to match on a `call`.** `stepi` goes
+        into the function; `nexti` runs all of it and stops on the next line.
+
+  - name: "13. Where to go next, and a cheat sheet"
+    type: markdown
+    content: |
+      ## Cheat sheet
+
+      ```
+      READ THE PROGRAM                     objdump -d -M intel /challenge/NAME | more     (search /<main>:)
+      ONE FUNCTION ONLY                    objdump -d -M intel --disassemble=main /challenge/NAME
+      READ ITS CONSTANT DATA               objdump -s -j .rodata /challenge/NAME
+      DEBUG IT                             gdb /challenge/NAME   then  break main / run / ni / si
+
+      INTEL SYNTAX                         mov DST, SRC            DST changes
+      SIZES                                BYTE 1  WORD 2  DWORD 4  QWORD 8
+      ARGUMENTS                            rdi rsi rdx rcx r8 r9   return value in rax
+      REGISTER NAMES                       rax / eax / ax / al     (writing eax zeroes the top of rax)
+      LOCALS                               [rbp-0x..]              return address at [rbp+0x8]
+      STACK                                grows down; push: rsp -= 8; pop: rsp += 8
+      SIGNED JUMPS                         jl jle jg jge
+      UNSIGNED JUMPS                       jb jbe ja jae           je / jne work for both
+      LOOP                                 a jump to a LOWER address
+      LITTLE-ENDIAN                        0x11223344 is stored as 44 33 22 11
+      32-BIT MATH IN PYTHON                (x + y) & 0xffffffff
+
+      GDB                                  x/8gx $rsp   x/4wx $rbp-0x10   x/s ADDR   x/5i $rip
+                                           p/x $rax   info registers   display/i $pc
+      ```
+
+      Python is a fine calculator. `python3 -c "print(hex((0xfffffff0 + 0x20) & 0xffffffff))"`
+      prints `0x10`: the sum wrapped around, as it would in a 32-bit register.
+
+      ## Further reading (all free)
+
+      - [pwn.college Computing 101](https://pwn.college/computing-101/):
+        hands-on assembly from the very beginning, including byte order and
+        the stack. A good next step after this module.
+      - [x86 instruction reference](https://www.felixcloutier.com/x86/): look
+        up any instruction you do not recognise.
+      - [Compiler Explorer](https://godbolt.org/): type C on the left, see the
+        assembly on the right. Choose "x86-64 gcc", and add `-O0 -masm=intel`
+        as compiler options to match what you see here.
+      - [Beej's Quick Guide to GDB](https://beej.us/guide/bggdb/): a short,
+        friendly gdb introduction.
+      - [OpenSecurityTraining2](https://p.ost2.fyi/): free full courses on x86-64
+        assembly and debuggers, when you want depth.

@@ -1,0 +1,1 @@
+The program repeats a small calculation a number of times that you choose, then checks the final value against a target. Work out the calculation from the assembly and find how many repeats reach the target.

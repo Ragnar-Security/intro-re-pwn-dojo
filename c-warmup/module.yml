@@ -1,0 +1,462 @@
+name: C Warmup
+description: |
+  Practice the parts of C that appear in later challenges: types, pointers,
+  strings, and memory.
+
+  These challenges work backwards from the rest of the dojo: **you write a
+  small C program and the challenge grades it.** Run a challenge with no
+  arguments to read your task, then compile and submit:
+
+  ```
+  /challenge/c-compile
+  nano ~/solution.c
+  gcc ~/solution.c -o ~/solution
+  /challenge/c-compile ~/solution
+  ```
+
+  Each challenge tests your program on randomly chosen inputs, so typing the
+  answers in will not work. Suggested order: c-compile, c-types, c-pointers,
+  c-strings, c-memory.
+challenges:
+  - id: c-compile
+    name: Compile a C Program
+  - id: c-types
+    name: C Types
+  - id: c-pointers
+    name: Pointers
+  - id: c-strings
+    name: Strings
+  - id: c-memory
+    name: Memory
+resources:
+  - name: "Start here: C from zero"
+    type: markdown
+    content: |
+      ## What this module is about
+
+      Most programs you will take apart in this dojo were written in C. When you
+      read assembly or a decompiler's output, you are reading C that has been
+      turned into machine instructions, so knowing a little C lets you guess
+      what the original code looked like. C also lets a program touch memory
+      directly and does not check that you stay inside what you were given. That
+      is the root of nearly every memory bug in later modules.
+
+      This module works backwards from the rest of the dojo. **You write a small
+      C program, and the challenge grades it.** You need no earlier C. Read this
+      page once, then do the challenges in this order: `c-compile`, `c-types`,
+      `c-pointers`, `c-strings`, `c-memory`.
+
+      ## How the grader works
+
+      Every challenge here is a **grader**, a program that tests other programs.
+
+      ```
+      /challenge/c-types                   no argument: prints YOUR task
+      /challenge/c-types ~/solution        with a path: tests your program
+      ```
+
+      The steps are the same each time:
+
+      1. Run the challenge with no argument and read the task. Details such as
+         names and formats differ between students, so read your own copy.
+      2. Write your program in `~/solution.c` with `nano` (a terminal text editor).
+      3. Compile it: `gcc ~/solution.c -o ~/solution`. This turns your text into
+         a runnable program called `solution`.
+      4. Run the challenge again with the path to that program.
+
+      The grader runs your program several times. Each run gets **random input**
+      and the grader checks what your program prints. Typing the expected answers
+      into your program will not work, because the input changes every run. Your
+      program has to compute the answer.
+
+      The grader compares your output line by line. It ignores spaces at the end
+      of a line and blank lines at the end of the output, but the words, numbers
+      and punctuation must match the task. When a test fails you see three
+      blocks: the input it gave your program, the output it expected, and the
+      output you produced. Compare them character by character. If your program
+      crashes or runs longer than 5 seconds, the grader says so.
+
+      Your program runs without special privileges, so it cannot read the flag
+      itself. When every test passes, the grader prints the flag for you.
+
+      ## Concept 1: compiling a program
+
+      A computer cannot run C text directly. A **compiler** (`gcc` here) turns
+      your **source file** into a **binary**, a file of machine instructions the
+      CPU can run. Here is the smallest useful program, `hello.c`:
+
+      ```c
+      #include <stdio.h>
+
+      int main(void) {
+          printf("hello from C\n");
+          return 0;
+      }
+      ```
+
+      - `#include <stdio.h>` pulls in the declaration of `printf`, the printing function.
+      - `main` is where every C program starts. `int` says it returns a whole number; `return 0` means "it worked".
+      - `\n` is a newline character: it ends the line of output.
+      - Every statement ends with `;`.
+
+      ```
+      $ gcc hello.c -o hello
+      $ ./hello
+      hello from C
+      ```
+
+      `-o hello` names the output file. `./` means "the file in this directory"
+      (the shell does not look in the current directory unless you say so). The
+      `file` command shows what you built:
+
+      ```
+      $ file hello
+      hello: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, ...
+      ```
+
+      **ELF** is the file format for programs on Linux. **x86-64** is the kind of
+      CPU the instructions are for. Everything later in the dojo is about
+      programs like this one.
+
+      **Reading a compiler error.** Forget the semicolon after `return 0` and
+      `gcc` prints:
+
+      ```
+      bad.c: In function 'main':
+      bad.c:1:26: error: expected ';' before '}' token
+          1 | int main(void) { return 0 }
+            |                          ^~
+            |                          ;
+      ```
+
+      The format is `file:line:column: message`. The `^~` marks where gcc got
+      confused, and the `;` underneath is its suggested fix. Fix the **first**
+      error and compile again: later errors are often side effects of the first.
+
+      To see what `gcc` produced from your C, ask it to stop at the assembly
+      stage with `gcc -S -masm=intel hello.c -o -`. The start of `main` is:
+
+      ```
+      main:
+              endbr64
+              push    rbp
+              mov     rbp, rsp
+      ```
+
+      You do not need to understand these lines yet. The point is that your
+      `main` really did become instructions. The "From source file to running
+      program" resource below explains the stages.
+
+      ## Concept 2: types and sizes
+
+      Memory is a long row of **bytes**. A byte holds a number from 0 to 255.
+      A **type** tells the compiler how many bytes a value uses and how to read
+      them. `char` is one byte. `int` is a whole number. Others (`short`, `long`,
+      `double`, ...) differ in size, and sizes depend on the system, so do not
+      guess them: ask the compiler with `sizeof`, which gives a size in bytes.
+      `printf` prints a `sizeof` result with `%zu`.
+
+      A **struct** groups several values under one name. The compiler places
+      each member at a spot that suits the CPU, which can leave unused gaps
+      called **padding**. Here is a toy (`sizes.c`):
+
+      ```c
+      #include <stdio.h>
+      #include <stddef.h>
+
+      struct T {
+          char  tag;
+          int   count;
+          short level;
+      };
+
+      int main(void) {
+          int nums[5];
+          printf("sizeof(int)      = %zu\n", sizeof(int));
+          printf("sizeof(nums)     = %zu\n", sizeof(nums));
+          printf("sizeof(struct T) = %zu\n", sizeof(struct T));
+          printf("offset of tag    = %zu\n", offsetof(struct T, tag));
+          printf("offset of count  = %zu\n", offsetof(struct T, count));
+          printf("offset of level  = %zu\n", offsetof(struct T, level));
+          return 0;
+      }
+      ```
+
+      ```
+      sizeof(int)      = 4
+      sizeof(nums)     = 20
+      sizeof(struct T) = 12
+      offset of tag    = 0
+      offset of count  = 4
+      offset of level  = 8
+      ```
+
+      Line by line: an `int` takes 4 bytes. An array of 5 ints takes 5 x 4 = 20.
+      `offsetof` reports how many bytes from the start of the struct a member
+      sits. The members add up to 1 + 4 + 2 = 7 bytes, but the struct is 12.
+      The picture shows why:
+
+      ```
+      byte:   0     1  2  3   4  5  6  7   8  9   10 11
+            +-----+--------+-----------+-------+--------+
+            | tag | (pad)  |   count   | level | (pad)  |
+            +-----+--------+-----------+-------+--------+
+      ```
+
+      `count` is an `int` and likes to start at a multiple of 4, so 3 padding
+      bytes follow `tag`. The struct also ends with 2 padding bytes so that an
+      array of `struct T` keeps every `count` aligned. This matters later:
+      when you read compiled code, a member shows up as "start of struct plus
+      some number", and that number is one of these offsets.
+
+      ## Concept 3: pointers
+
+      Every byte of memory has a number called its **address**. A **pointer** is
+      a variable that stores an address. Two symbols do the work:
+
+      - `&x` means "the address of `x`".
+      - `*p` means "the value stored at the address in `p`".
+
+      ```c
+      int x = 7;
+      int *p = &x;     // p holds the address of x
+      *p = 9;          // follow p, and change what is there
+      ```
+
+      Running a toy (`ptrs.c`) that does this and prints the addresses gave:
+
+      ```
+      x = 9, *p = 9
+      &x = 0x7ffec8228530, p = 0x7ffec8228530
+      ```
+
+      `x` changed even though we never wrote `x = 9`, because `p` points at `x`.
+      The two printed addresses are the same, since `p` stores `&x`. Your
+      addresses will differ from these: the system picks a different place on
+      every run. Memory looks like this:
+
+      ```
+      variable x (an int, 4 bytes)         variable p (a pointer, 8 bytes)
+      lives at address 0x7ffec8228530      lives somewhere else
+      +----------+                         +----------------+
+      |    9     |  <---------------------- | 0x7ffec8228530 |
+      +----------+      p points at x       +----------------+
+      ```
+
+      `p` is its own variable. What it stores is the address of `x`. On a 64-bit
+      system an address takes 8 bytes, which is why a pointer is 8 bytes.
+
+      Why bother? C gives a function **copies** of its arguments. If a function
+      should change a caller's variable, the caller must pass its address and the
+      function must write through it.
+
+      **Arrays and pointer arithmetic.** An array is a row of values side by
+      side. Its name acts like a pointer to the first one. Adding 1 to a pointer
+      moves it by the size of what it points at, not by one byte:
+
+      ```
+      int arr[3] = {10, 20, 30};
+      int *q = arr;
+
+      q = 0x7ffec8228554, q+1 = 0x7ffec8228558, *(q+1) = 20
+
+      address:  ...554      ...558      ...55c
+               +----------+----------+----------+
+               |    10    |    20    |    30    |
+               +----------+----------+----------+
+                  q          q+1        q+2
+      ```
+
+      `q+1` is 4 bytes after `q` because an `int` is 4 bytes. `*(q+1)` is the
+      same as `q[1]`. Square brackets are shorthand for "step over, then follow".
+
+      ## Concept 4: strings and the NUL terminator
+
+      C has no string type. A **string** is an array of `char`, where each `char`
+      is a one-byte number (a letter's code), and the end is marked by a byte
+      with the value 0, written `'\0'` and called the **NUL terminator**. Nothing
+      stores the length. Functions such as `strlen` and `printf("%s")` walk
+      forward until they find a 0.
+
+      The toy declares `char word[6] = "hello";` and prints each byte:
+
+      ```
+      strlen = 5, sizeof = 6
+      word[0] = 104     'h'
+      word[1] = 101     'e'
+      word[2] = 108     'l'
+      word[3] = 108     'l'
+      word[4] = 111     'o'
+      word[5] =   0     (the NUL)
+      ```
+
+      (The program prints only the numbers; the letters are added here for
+      reading.) In memory:
+
+      ```
+      index:    0    1    2    3    4    5
+              +----+----+----+----+----+----+
+              | h  | e  | l  | l  | o  | \0 |
+              +----+----+----+----+----+----+
+      value:   104  101  108  108  111   0
+      ```
+
+      `strlen` counts characters before the NUL, so it says 5. `sizeof` counts the
+      whole array, which includes the NUL, so it says 6. A 5-letter string needs
+      6 bytes. If the array were only 5 bytes long, the NUL would land outside
+      it, and `strlen` and `printf` would keep reading whatever sits next in
+      memory.
+
+      `fgets(buf, size, stdin)` reads one line into `buf` and **keeps the newline**
+      at the end. Cut it off by overwriting it with a NUL before measuring.
+
+      ## Concept 5: the stack and the heap
+
+      A running program has two places for data it creates:
+
+      ```
+      high addresses
+        stack    local variables; freed automatically when the function returns
+        ...
+        heap     memory you request with malloc; yours until you call free
+        ...
+      low addresses
+      ```
+
+      Variables such as `x` and `word` above live on the **stack**: the program
+      makes room when the function starts and reclaims it when the function
+      returns. Use the **heap** when you only learn how much you need while the
+      program runs, or when data has to outlive the function that made it.
+
+      ```c
+      char *heap = malloc(8);     // ask for 8 bytes; heap holds their address
+      strcpy(heap, "abc");        // copy the 4 bytes a, b, c, NUL into it
+      printf("%s at %p\n", heap, (void *)heap);
+      free(heap);                 // give the 8 bytes back
+      ```
+
+      The toy printed `heap string = abc at 0x6380c1b9b2b0`. Notice that the
+      heap address looks very different from the stack addresses above
+      (`0x7ffe...`): they are different regions.
+
+      ```
+      heap (malloc'd 8 bytes)
+      +----+----+----+----+----+----+----+----+
+      | a  | b  | c  | \0 |  ? |  ? |  ? |  ? |    ? = unset: could be anything
+      +----+----+----+----+----+----+----+----+
+      ```
+
+      Rules for `malloc`:
+
+      - It takes a size in **bytes**. For 10 ints ask for `10 * sizeof(int)`.
+      - It returns `NULL` when it cannot give you the memory. Check for that.
+      - Memory it returns is not cleared. It may hold old garbage.
+      - Call `free` once for each `malloc`, and do not touch the memory afterwards.
+      - Nothing stops you writing past the end. The program just damages
+        whatever sits next to it. This is what later modules exploit.
+
+      ## How to read the output of the tools
+
+      - **`gcc` errors:** `file:line:column: message`; start with the first one.
+      - **`gcc -Wall`** turns on more warnings. A warning is not an error but is
+        often a real mistake. Compile with `-Wall` while you learn.
+      - **A grader failure:** the three blocks `input given`, `expected output`,
+        `your output`. Find the first character where the last two differ.
+      - **`Segmentation fault` / SIGSEGV:** your program touched memory it may not.
+        Look for a pointer you never set, an index past the end of an array, or
+        a missing `&` in `scanf`.
+      - **`%p`** prints an address in hexadecimal (base 16: digits `0-9` then
+        `a-f`, and `0x` marks it). Cast the pointer to `(void *)` when printing.
+
+      ## Glossary
+
+      - **Address:** the number that says where a byte lives in memory.
+      - **Array:** values of one type stored side by side.
+      - **Binary:** a compiled program file you can run.
+      - **Byte:** the basic unit of memory, holding 0 to 255.
+      - **Compiler (`gcc`):** the tool that turns source code into a binary.
+      - **ELF:** the program file format on Linux.
+      - **Grader:** a program that runs yours and checks its output.
+      - **Heap:** memory you request with `malloc` and give back with `free`.
+      - **Hexadecimal:** base-16 numbers; addresses are usually shown this way.
+      - **NUL terminator (`'\0'`):** the zero byte that ends a string.
+      - **NULL:** the "points at nothing" pointer; `malloc` returns it on failure.
+      - **Offset:** how many bytes from the start of something a part sits.
+      - **Padding:** unused bytes the compiler adds inside a struct.
+      - **Pointer:** a variable that holds an address.
+      - **Source file:** the C text you write.
+      - **Stack:** the region holding local variables, reclaimed on return.
+      - **String:** a `char` array that ends with a NUL.
+      - **Struct:** several values grouped under one name.
+      - **`sizeof`:** the compiler's answer to "how many bytes?".
+
+      ## Common mistakes
+
+      - Forgetting the `&` in `scanf("%d", &a)`. `scanf` needs the address so it can fill in your variable.
+      - Forgetting the semicolon at the end of a statement, or the one after a struct's closing brace.
+      - Making a character array exactly as long as the text, leaving no room for the NUL.
+      - Forgetting that `fgets` keeps the newline, so your output has an extra line break or the length is off by one.
+      - Typing a size number instead of using `sizeof`.
+      - Asking `malloc` for a count of elements instead of a count of bytes.
+      - Starting a "largest so far" at 0 when all the numbers can be negative.
+      - Printing with the wrong format letter: `%d` for whole numbers, `%zu` for `sizeof`, `%s` for strings, `%c` for one character.
+      - Using memory after `free`, or calling `free` twice on the same pointer.
+      - Skipping the compile step after editing: the grader runs the old binary.
+
+      ## Where to go next
+
+      - `man 3 printf`, `man 3 malloc`, `man 3 strlen` (the `man` command shows built-in manuals; press `q` to quit).
+      - The pwn.college "Intro to Cybersecurity" dojos at https://pwn.college are free and cover the Linux terminal, assembly and memory errors. Use them as further reading.
+      - Beej's Guide to C Programming, free online at https://beej.us/guide/bgc/ .
+
+  - name: "Why learn C first"
+    type: markdown
+    content: |
+      Most programs you will examine later in this dojo were written in C, and
+      a **decompiler** (a tool that turns a compiled program back into
+      approximate C) prints C. Having written a little C yourself makes that
+      output readable.
+
+      C is thin: there is almost nothing between your source code and the
+      machine instructions. A local variable becomes a spot on the stack, an
+      array index becomes an address calculation, and a struct field becomes a
+      fixed distance from the start of the struct. C also does not check your
+      work. Writing past the end of an array or using memory after freeing it is
+      allowed, which is why those mistakes are the starting point for binary
+      exploitation.
+
+  - name: "From source file to running program"
+    type: markdown
+    content: |
+      `gcc` does four jobs in a row:
+
+      1. **Preprocess** (`gcc -E`): paste in `#include` files and expand `#define`.
+      2. **Compile** (`gcc -S`): turn C into assembly, the readable form of CPU instructions.
+      3. **Assemble** (`gcc -c`): turn assembly into an object file of real machine code, with blanks for calls to code that lives elsewhere.
+      4. **Link**: fill in those blanks using libraries such as the one that provides `printf`, and produce the final program.
+
+      Running `gcc file.c -o name` does all four. Running one stage at a time
+      (the flags above) lets you look at what each one produced.
+
+  - name: "Pointers and memory in one page"
+    type: markdown
+    content: |
+      A **pointer** holds an address. `&x` is the address of `x`; `*p` is the
+      value stored at the address in `p`. Adding 1 to an `int *` moves it by
+      `sizeof(int)` bytes, not by one byte.
+
+      A running program keeps data in a few regions:
+
+      ```
+      high addresses
+        stack    local variables; cleaned up when the function returns
+        ...
+        heap     memory from malloc; yours until you call free
+        .data    global variables that start with a value
+        .rodata  constants and string literals (read-only)
+        .text    the program's instructions
+      low addresses
+      ```
+
+      A **string** is an array of characters ending in a zero byte (`'\0'`).
+      Nothing records its length; code finds the end by searching for that zero.

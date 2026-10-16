@@ -1,0 +1,694 @@
+name: Shellcode
+description: |
+  Learn what shellcode is, test small machine-code programs, and redirect a
+  vulnerable program to shellcode you provide.
+
+  Start with the "Start here" resource below. It explains system calls, walks
+  through a tiny hand-written program byte by byte, and covers bad bytes,
+  executable memory, setuid programs, and how a leaked address lets you jump
+  to your own code. Suggested order: shellcode-tester, then ret2shellcode-64.
+challenges:
+  - id: shellcode-tester
+    name: Test Shellcode
+  - id: ret2shellcode-64
+    name: Return to Shellcode
+resources:
+  - name: "Start here: what this module is about"
+    type: markdown
+    content: |
+      **Shellcode** is a small piece of machine code that *you* supply, as raw
+      bytes, and that a program then runs as if it were its own instructions.
+      The name comes from the classic goal: make the program start a shell.
+
+      Until now you have read code that someone else wrote. Here you write the
+      code. That matters for exploitation because many memory bugs end with "the
+      CPU jumps to an address the attacker chose." If you can also put bytes at
+      that address, those bytes can do anything the program is allowed to do,
+      such as read a file only root can read.
+
+      In this module you will:
+
+      1. Learn how a program asks Linux to do things (a **system call**).
+      2. Write a tiny program by hand that prints a message, and look at its bytes.
+      3. Assemble code from Python with pwntools, and see why some bytes are "bad".
+      4. Learn why code can only run from **executable** memory (NX).
+      5. Learn why a setuid program's shell drops its root powers, and the fix.
+      6. Learn how a leaked address lets you jump back into your own bytes.
+
+      Then you use all of it: `shellcode-tester` runs whatever bytes you give it,
+      and `ret2shellcode-64` makes you get your bytes run through a buffer
+      overflow.
+
+      You need: the Assembly Basics module (registers, `mov`, little-endian
+      byte order) and the 64-bit "Return to win()" challenge from Your First
+      Memory Bug (overwriting a saved return address).
+
+  - name: "System calls, registers, and machine code"
+    type: markdown
+    content: |
+      ### Machine code is just bytes
+      The CPU does not read assembly text. It reads bytes. An **assembler** turns
+      text such as `mov eax, 1` into bytes such as `b8 01 00 00 00`. A
+      **disassembler** (`objdump`, gdb, pwntools `disasm`) goes the other way.
+      Shellcode is those bytes, written into memory somewhere, and run.
+
+      ```
+      assembly text           assembler          bytes in memory
+      mov eax, 1      ------------------------>  b8 01 00 00 00
+      syscall         ------------------------>  0f 05
+      ```
+
+      ### System calls
+      A program cannot touch files, the screen, or other programs by itself. It
+      asks the **kernel** (the core of the operating system) to do it. That
+      request is a **system call** ("syscall"). C functions such as `write()`,
+      `open()`, and `exit()` are thin wrappers around syscalls. Shellcode
+      usually has no C library to call, so it makes the syscalls directly.
+
+      On Linux x86-64, a syscall works like this:
+
+      ```
+        register   what goes in it
+        --------   -----------------------------------------
+        rax        the syscall NUMBER (which service you want)
+        rdi        argument 1
+        rsi        argument 2
+        rdx        argument 3
+        r10        argument 4   (note: r10, not rcx)
+        r8, r9     arguments 5 and 6
+
+        then run the instruction:  syscall
+
+        afterwards:
+        rax        the return value (a negative number means an error)
+        rcx, r11   overwritten by the CPU, do not rely on them
+      ```
+
+      Numbers used in this module (the full list is in the Linux source file
+      `arch/x86/entry/syscalls/syscall_64.tbl`). In the workspace,
+      `pwn constgrep -c amd64 SYS_setreuid` looks one up. Keep the `-c amd64`:
+      without it pwntools answers for 32-bit x86, where the numbers differ.
+
+      ```
+        number  name       C prototype (simplified)
+        ------  --------   -----------------------------------------------
+           0    read       read(int fd, void *buf, size_t count)
+           1    write      write(int fd, const void *buf, size_t count)
+           2    open       open(const char *path, int flags)
+          59    execve     execve(const char *path, char **argv, char **envp)
+          60    exit       exit(int status)
+         107    geteuid    geteuid(void)
+         113    setreuid   setreuid(uid_t ruid, uid_t euid)
+      ```
+
+      A **file descriptor** ("fd") is a small number naming an open file. Every
+      program starts with three: `0` = standard input, `1` = standard output,
+      `2` = standard error. `open()` returns a new one (usually `3`).
+
+      ### One register, several names
+      `eax` is the low 32 bits of `rax`; `al` is the low 8 bits. Writing a
+      32-bit register (`mov eax, 1`) clears the upper 32 bits of `rax`, so
+      `mov eax, 1` sets all of `rax` to 1 with a shorter instruction.
+
+      ```
+        rax  [ 63 ............ 32 | 31 ...... 8 | 7 .. 0 ]
+        eax                       [ 31 ................0 ]
+        al                                      [ 7 .. 0 ]
+      ```
+
+      ### Shellcode does not know where it is
+      A normal program knows where its data is, because the linker placed it.
+      Shellcode gets copied to an address you may not know in advance. So it
+      finds its data **relative to itself** (`lea rsi, [rip + label]`, where
+      `rip` is the address of the next instruction) or builds the data on the
+      stack with `push` and then uses `rsp` as the address. Both appear below.
+
+  - name: "Worked example: a 42-byte program that prints a message"
+    type: markdown
+    content: |
+      This toy is not one of the challenges. It calls `write(1, "hi there\n", 9)`
+      and then `exit(0)`, using nothing but syscalls. Save it as `hello.s`:
+
+      ```
+      # hello.s -- write(1, msg, 9) then exit(0), using only system calls.
+      .intel_syntax noprefix
+      .global _start
+      _start:
+          mov  eax, 1              # syscall number 1 = write
+          mov  edi, 1              # arg 1: fd 1 = standard output
+          lea  rsi, [rip + msg]    # arg 2: address of the bytes to print
+          mov  edx, 9              # arg 3: how many bytes
+          syscall
+          mov  eax, 60             # syscall number 60 = exit
+          xor  edi, edi            # arg 1: exit status 0
+          syscall
+      msg:
+          .ascii "hi there\n"
+      ```
+
+      `xor edi, edi` sets `edi` to 0 (any value XOR itself is 0). `_start` is
+      where a program begins when there is no C `main`.
+
+      ### Build and run
+      ```
+      $ as hello.s -o hello.o      # assemble: text -> machine code
+      $ ld hello.o -o hello        # link: make a runnable program
+      $ ./hello
+      hi there
+      ```
+
+      ### Watch the syscalls happen
+      `strace` prints every syscall a program makes:
+
+      ```
+      $ strace ./hello
+      execve("./hello", ["./hello"], 0x7ffed4b0f620 /* 11 vars */) = 0
+      write(1, "hi there\n", 9hi there
+      )               = 9
+      exit(0)                                 = ?
+      +++ exited with 0 +++
+      ```
+
+      The first line is the shell starting the program. Then exactly our two
+      syscalls. `= 9` is the return value of `write` (9 bytes written). The
+      message itself is mixed into the strace line because both print to the
+      same terminal.
+
+      ### Look at the bytes
+      ```
+      $ objdump -d -M intel hello
+      0000000000401000 <_start>:
+        401000:  b8 01 00 00 00         mov    eax,0x1
+        401005:  bf 01 00 00 00         mov    edi,0x1
+        40100a:  48 8d 35 10 00 00 00   lea    rsi,[rip+0x10]        # 401021 <msg>
+        401011:  ba 09 00 00 00         mov    edx,0x9
+        401016:  0f 05                  syscall
+        401018:  b8 3c 00 00 00         mov    eax,0x3c
+        40101d:  31 ff                  xor    edi,edi
+        40101f:  0f 05                  syscall
+
+      0000000000401021 <msg>:
+        401021:  68 69 20 74 68         push   0x68742069
+        401026:  65 72 65               gs jb  40108e <msg+0x6d>
+        401029:  0a                     .byte 0xa
+      ```
+
+      Line by line:
+
+      - `b8 01 00 00 00` is `mov eax, 1`. `b8` means "move a 4-byte number into
+        `eax`"; the number follows in little-endian order: `01 00 00 00` = 1.
+      - `0x3c` is 60 in hexadecimal: the `exit` syscall number.
+      - `lea rsi,[rip+0x10]`: while this instruction runs, `rip` already holds
+        the address of the *next* instruction, `0x401011`. Plus `0x10` gives
+        `0x401021`, which is `msg`. objdump does that sum for you in the comment.
+        Because the distance is relative, this code works wherever it is copied.
+      - `0f 05` is `syscall`.
+      - Under `<msg>`, objdump tries to read our **text** as instructions and
+        prints nonsense (`push`, `gs jb`). The bytes `68 69 20 74 ...` are really
+        the letters `h i (space) t ...`, and `0a` is the newline. A disassembler
+        cannot tell code from data; you have to.
+
+      The whole program is 33 bytes of code plus 9 bytes of text: 42 bytes.
+
+      ### Check the registers right before the syscall (gdb)
+      ```
+      (gdb) break *0x401016
+      (gdb) run
+      Breakpoint 1, 0x0000000000401016 in _start ()
+      (gdb) info registers rax rdi rsi rdx rip
+      rax            0x1                 1
+      rdi            0x1                 1
+      rsi            0x401021            4198433
+      rdx            0x9                 9
+      rip            0x401016            0x401016 <_start+22>
+      (gdb) x/s $rsi
+      0x401021 <msg>: "hi there\n"
+      (gdb) x/9xb $rsi
+      0x401021 <msg>: 0x68    0x69    0x20    0x74    0x68    0x65    0x72    0x65
+      0x401029 <msg+8>:       0x0a
+      ```
+
+      `break *0x401016` stops *at* the `syscall` instruction, before it runs.
+      `rax` = 1 (write), `rdi` = 1 (stdout), `rsi` points at the text, `rdx` =
+      9. This is the single most useful check when your shellcode misbehaves:
+      stop on the `syscall` and read the four registers.
+
+      ### The same thing from Python, with pwntools
+      **pwntools** is a Python library for exploitation (installed in the
+      workspace). `asm()` assembles text to bytes; `disasm()` goes back.
+
+      ```python
+      from pwn import *
+      context.arch = "amd64"          # tell pwntools which CPU: 64-bit x86
+      sc = asm(r"""
+          mov  eax, 1
+          mov  edi, 1
+          lea  rsi, [rip + msg]
+          mov  edx, 9
+          syscall
+          mov  eax, 60
+          xor  edi, edi
+          syscall
+      msg:
+          .ascii "hi there\n"
+      """)
+      print(len(sc))
+      print(sc.hex())
+      ```
+      ```
+      42
+      b801000000bf01000000488d3510000000ba090000000f05b83c00000031ff0f0568692074686572650a
+      ```
+
+      The same 42 bytes objdump showed. To run raw bytes and see what they do,
+      pwntools can wrap them into a tiny program: `make_elf(sc, extract=False)`
+      returns a file path you can start with `process(path)`. For this toy it
+      printed `b'hi there\n'` and exited with code 0.
+
+      From the shell, `pwn asm` and `pwn disasm` do quick one-offs:
+
+      ```
+      $ pwn asm -c amd64 -f hex "mov eax, 1; syscall"
+      b8010000000f05
+      $ pwn disasm -c amd64 b8010000000f05
+         0:   b8 01 00 00 00          mov    eax, 0x1
+         5:   0f 05                   syscall
+      ```
+
+      ### shellcraft: ready-made pieces
+      `shellcraft` generates assembly text for common jobs. Always **print it and
+      read it** before using it:
+
+      ```python
+      print(shellcraft.echo("hi there\n"))
+      ```
+      ```
+          /* push b'hi there\n' */
+          push 0xb
+          dec byte ptr [rsp]
+          mov rax, 0x6572656874206968
+          push rax
+          /* call write('1', 'rsp', 9) */
+          push SYS_write /* 1 */
+          pop rax
+          push (1) /* 1 */
+          pop rdi
+          push 9
+          pop rdx
+          mov rsi, rsp
+          syscall
+      ```
+
+      This version builds the text **on the stack** instead of storing it after
+      the code: `push rax` puts the 8 letters "hi there" on the stack (written
+      little-endian, so they read backwards in the number), and `rsi = rsp`
+      points at them. Notice the odd `push 0xb` / `dec byte ptr [rsp]`: it pushes
+      11 and subtracts 1 to make 10, the newline. The next lesson explains why it
+      avoids writing `0a` directly. `asm(shellcraft.echo("hi there\n") +
+      shellcraft.exit(0))` is 37 bytes and also prints `hi there`.
+
+      Other templates you will meet: `shellcraft.cat(path)` (open + read +
+      write a file), `shellcraft.sh()` (run `/bin/sh` with `execve`), and
+      `shellcraft.setreuid()` (explained below).
+
+  - name: "Bad bytes: newline and NUL"
+    type: markdown
+    content: |
+      Your shellcode has to travel into the program through some input
+      function, and many input functions **stop early** on certain bytes:
+
+      ```
+        input function       stops at                     so this byte is "bad"
+        -----------------    --------------------------   ---------------------
+        fgets, gets          newline 0x0a (end of line)   0x0a
+        scanf("%s")          any whitespace               0x09 0x0a 0x0b 0x0c 0x0d 0x20
+        strcpy, strcat       NUL 0x00 (end of string)     0x00
+        read                 nothing (counts bytes)       none, unless the program checks
+      ```
+
+      A **bad byte** is a byte that cuts your input short or that the program
+      refuses. Anything after it never arrives, so the CPU runs half your code
+      and then garbage. Some programs also check the bytes themselves and reject
+      input that contains a forbidden value.
+
+      ### Find them
+      The hello toy from the worked example has both kinds:
+
+      ```python
+      >>> b"\x0a" in sc, b"\x00" in sc
+      (True, True)
+      >>> sc.index(b"\x0a")
+      41
+      ```
+
+      Byte 41 is the newline at the end of the text. The NULs come from the
+      4-byte numbers: `mov edx, 9` is `ba 09 00 00 00`, three zero bytes.
+
+      ### Remove them by writing the same thing differently
+      Many instructions have several encodings. Real measurements:
+
+      ```
+        instruction                   bytes              bad bytes?
+        ---------------------------   ----------------   ---------------
+        mov eax, 1                    b8 01 00 00 00     NUL x3
+        xor eax, eax; inc eax         31 c0 ff c0        none
+        mov eax, 60                   b8 3c 00 00 00     NUL x3
+        push 60; pop rax              6a 3c 58           none
+        mov edx, 10                   ba 0a 00 00 00     newline and NUL
+        push 10; pop rdx              6a 0a 5a           newline
+        push 9; pop rdx; inc edx      6a 09 5a ff c2     none
+      ```
+
+      `push` of a small number uses a 1-byte form (`6a XX`), so it avoids the
+      zeros. If the number *itself* is a bad byte, build it from a neighbour
+      (push 9 then add 1, or push 11 then subtract 1, as `shellcraft.echo` did).
+      The same trick works for text: push it with a different byte and fix
+      that byte afterwards.
+
+      Check every payload before you send it:
+
+      ```python
+      assert b"\x0a" not in sc, sc.hex()
+      ```
+
+      A leaked **address** can also contain a bad byte, and you do not choose
+      that one. If a run's address contains it, run the program again: the
+      address changes every run.
+
+  - name: "Executable memory and NX"
+    type: markdown
+    content: |
+      Every page of memory (a 4096-byte block) has three permission bits:
+      **r**ead, **w**rite, e**x**ecute. The CPU refuses to run instructions
+      from a page without `x`. That rule is **NX** ("no-execute"). If you jump
+      into a non-executable page, the program crashes with a segmentation fault
+      on the very first instruction, before your code does anything.
+
+      Shellcode needs memory that is **both writable** (so your bytes can be put
+      there) **and executable** (so they can run). Normal programs avoid having
+      such memory, so an exploit needs one of these:
+
+      ```
+        how memory becomes writable + executable     example
+        -----------------------------------------    ---------------------------------
+        program asks for it with mmap(PROT_EXEC)     a "tester" that runs your input
+        program built with -z execstack              the stack becomes rwx
+        (in later courses) a syscall that changes    mprotect(), called by ROP
+        permissions
+      ```
+
+      ### See it for yourself
+      The same toy (`leak.c`, below) compiled two ways:
+
+      ```
+      $ gcc leak.c -o leak
+      $ gcc -fno-stack-protector -no-pie -z execstack leak.c -o leak-execstack
+      ```
+
+      `readelf -lW` shows a header line that tells the loader how to set up
+      the stack:
+
+      ```
+      leak:            GNU_STACK ... RW  0x10
+      leak-execstack:  GNU_STACK ... RWE 0x10
+      ```
+
+      `checksec` summarises it (other columns trimmed):
+
+      ```
+      leak:            Full RELRO      Canary found      NX enabled    PIE enabled
+      leak-execstack:  Partial RELRO   No canary found   NX disabled   No PIE
+      ```
+
+      And inside a running program, gdb's `info proc mappings` (pwndbg:
+      `vmmap`) shows the real permissions of the stack (only the `[stack]` line
+      of each program shown, labelled with the program's name):
+
+      ```
+      leak            0x7ffdccfbf000  0x7ffdccfe0000  0x21000  0x0  rw-p  [stack]
+      leak-execstack  0x7ffd9a040000  0x7ffd9a061000  0x21000  0x0  rwxp  [stack]
+      ```
+
+      Columns: start address, end address, size, offset in the file, permissions
+      (`p` means private to this process), and what the memory belongs to.
+      `rwxp` is what you want to see where your shellcode will sit.
+
+  - name: "Setuid programs: why the shell drops root, and the fix"
+    type: markdown
+    content: |
+      A **setuid** program runs with the privileges of the file's *owner*, not
+      of the person who started it. `ls -l` shows an `s` where the owner's `x`
+      would be: `-rwsr-xr-x 1 root root ... uids`. The challenges here are setuid
+      root, which is how they can read `/flag`.
+
+      A process carries two user ids:
+
+      ```
+        real uid       who started the program         (you, e.g. 1000)
+        effective uid  whose permissions are checked    (root = 0, for setuid root)
+      ```
+
+      Opening a file checks the **effective** uid, so shellcode that opens,
+      reads, and writes `/flag` works as it is. But shells (`bash`, and `dash`,
+      which is `/bin/sh` on Ubuntu) protect themselves: when they start and the
+      two ids differ, they **set the effective uid back to the real uid**. Your
+      new shell is you, not root.
+
+      ### Measured with a toy (not a challenge)
+      ```c
+      /* uids.c -- show real vs effective user id, then start a shell command. */
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <unistd.h>
+      int main(int argc, char **argv) {
+          printf("before: real uid=%d  effective uid=%d\n", getuid(), geteuid());
+          if (argc > 1)                       /* any argument: fix the ids first */
+              setreuid(geteuid(), -1);
+          printf("now:    real uid=%d  effective uid=%d\n", getuid(), geteuid());
+          fflush(stdout);
+          execl("/bin/sh", "sh", "-c", "id", (char *)NULL);
+          return 1;
+      }
+      ```
+
+      Installed as setuid root and run by a normal user (uid 1000):
+
+      ```
+      $ uids
+      before: real uid=1000  effective uid=0
+      now:    real uid=1000  effective uid=0
+      uid=1000(hacker) gid=1000(hacker) groups=1000(hacker)
+
+      $ uids fix
+      before: real uid=1000  effective uid=0
+      now:    real uid=0  effective uid=0
+      uid=0(root) gid=1000(hacker) groups=1000(hacker)
+      ```
+
+      Without the fix, the shell's `id` says uid 1000: root is gone. With
+      `setreuid(geteuid(), -1)` first, both ids are 0 and the shell keeps root.
+
+      `setreuid(ruid, euid)` sets the real and effective uid; `-1` means "leave
+      this one unchanged". So `setreuid(geteuid(), -1)` copies the effective uid
+      (0) into the real uid. In shellcode that is two syscalls: `geteuid` (107),
+      whose result comes back in `rax`, then `setreuid` (113) with that result
+      as argument 1. `shellcraft.setreuid()` with no arguments generates this
+      for you; print it and read it.
+
+      You only need this when your shellcode **starts a shell or another
+      program**. Shellcode that reads a file directly does not.
+
+  - name: "Using a leaked address to jump to your code"
+    type: markdown
+    content: |
+      In "Return to win()" you overwrote a function's saved return address with
+      the address of `win()`. Now the target is **your own bytes**, sitting in
+      the buffer you overflowed. Picture the stack frame (addresses grow
+      downward on the page, as in gdb):
+
+      ```
+        lower addresses
+        +---------------------------+  <- buf starts here
+        |  buf                      |
+        |  (the local array)        |
+        |                           |
+        +---------------------------+
+        |  saved rbp      (8 bytes) |
+        +---------------------------+
+        |  return address (8 bytes) |  <- `ret` jumps to whatever is stored here
+        +---------------------------+
+        higher addresses
+      ```
+
+      Write too much into `buf` and you can fill it like this:
+
+      ```
+        +---------------------------+  <- buf starts here  (= address A)
+        |  your shellcode           |
+        |  padding (any bytes)      |
+        +---------------------------+
+        |  padding                  |
+        +---------------------------+
+        |  A, as 8 bytes            |  -> `ret` jumps back up to your shellcode
+        +---------------------------+
+      ```
+
+      Three things must be true:
+
+      1. The stack must be executable (previous lesson).
+      2. You must know the **distance** from the start of `buf` to the return
+         address. It is fixed for a given program; measure it with
+         `cyclic()` / `cyclic_find()` as in the memory bug module.
+      3. You must know **A**, the address of `buf`. This is the hard part.
+
+      ### Why you need a leak
+      **ASLR** (address space layout randomization) places the stack at a
+      random address on every run. The toy `leak.c` (not a challenge):
+
+      ```c
+      #include <stdio.h>
+      int main(void) {
+          char buf[32];
+          printf("buf is at %p\n", (void *)buf);
+          return 0;
+      }
+      ```
+      ```
+      $ ./leak; ./leak; ./leak
+      buf is at 0x7ffc19fd9ad0
+      buf is at 0x7fff7fbb8370
+      buf is at 0x7ffe1ff7a630
+      ```
+
+      A different address each time, so a number you saw in one run is useless
+      in the next. A **leak** is the program revealing an address while it runs.
+      Your exploit must read the leak and build the payload **in the same run**,
+      before sending it. pwntools makes this a few lines:
+
+      ```python
+      from pwn import *
+      context.log_level = "error"       # hide pwntools' own status messages
+      p = process("./leak")
+      line = p.recvline()               # b'buf is at 0x7ffc5e5bd820\n'
+      addr = int(line.split()[-1], 16)  # last word, read as base 16
+      print(hex(addr))
+      print(p64(addr).hex(" "))
+      ```
+      ```
+      0x7ffc5e5bd820
+      20 d8 5b 5e fc 7f 00 00
+      ```
+
+      `p64()` turns a number into the 8 bytes the CPU expects in memory:
+      little-endian, lowest byte first. Note the two `00` bytes at the end:
+      stack addresses on x86-64 Linux all have them. That is fine for `fgets` and `read`,
+      but a `strcpy` overflow would stop at the first one.
+
+      Put the shellcode at the **start** of the buffer. When your code runs,
+      `rsp` points just above the overwritten return address, and every `push`
+      moves it down, toward the end of your buffer. A long chain of pushes can
+      overwrite the last bytes of your own shellcode. Starting at the lowest
+      address leaves the most room.
+
+  - name: "How to read the tool output"
+    type: markdown
+    content: |
+      ### `objdump -d -M intel`
+      ```
+        401011:  ba 09 00 00 00         mov    edx,0x9
+        ^^^^^^   ^^^^^^^^^^^^^^         ^^^^^^^^^^^^^^
+        address  the instruction's       the instruction, in Intel syntax
+                 bytes, in memory order  (destination first, then source)
+      ```
+      `-M intel` picks Intel syntax (the one used in this dojo). Without it you
+      get AT&T syntax, where the order is reversed and registers start with `%`.
+
+      ### pwntools `disasm()`
+      Same three columns, but addresses start at 0: they are **offsets** from
+      the start of your bytes, because pwntools does not know where they will
+      be loaded.
+
+      ### gdb
+      - `info registers rax rdi rsi rdx`: value in hex, then in decimal.
+      - `x/s ADDR`: show memory at ADDR as a text string.
+      - `x/9xb ADDR`: show 9 units, in he**x**, each one a **b**yte.
+      - `x/8gx $rsp`: show 8 **g**iant (8-byte) units in hex, starting at the
+        stack pointer. Each 8-byte value is shown as a number, so its bytes appear
+        in reverse (little-endian) order compared with `x/xb`.
+      - `x/10i $rip`: show the next 10 **i**nstructions. Use this on your
+        shellcode's address to check it landed intact.
+      - `break *ADDR`: stop when the CPU reaches that exact address. The `*`
+        means "an address", not a function name.
+      - `stepi` (`si`): run exactly one instruction.
+
+      ### strace
+      Each line is `syscall_name(arguments) = return value`. A return value of
+      `-1 ENOENT (No such file or directory)` means it failed and says why. If
+      your shellcode prints nothing, run the program under `strace`: you will
+      see which syscall ran, with which arguments, and whether it failed.
+
+  - name: "Glossary, common mistakes, where next"
+    type: markdown
+    content: |
+      ### Glossary
+      - **Shellcode**: machine code you supply as raw bytes, which a program then runs.
+      - **Machine code**: the bytes the CPU executes.
+      - **Assembler / disassembler**: tools that convert assembly text to bytes, and back.
+      - **Kernel**: the core of the operating system; it owns files, memory, and processes.
+      - **System call (syscall)**: a request from a program to the kernel. On x86-64 Linux: number in `rax`, arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, then the `syscall` instruction.
+      - **File descriptor (fd)**: a small number naming an open file. 0 = stdin, 1 = stdout, 2 = stderr.
+      - **pwntools**: a Python library for exploitation. `asm`, `disasm`, `shellcraft`, `p64`, `process`, `cyclic`.
+      - **shellcraft**: the part of pwntools that writes assembly for common jobs.
+      - **Position-independent code**: code that works at any address because it finds its data relative to itself (`rip`) or on the stack (`rsp`).
+      - **Bad byte**: a byte that stops or is rejected by the input path (often `0x0a` newline or `0x00` NUL).
+      - **NUL**: the zero byte, `0x00`. Ends a C string.
+      - **Page**: a 4096-byte block of memory with its own read/write/execute permissions.
+      - **NX**: "no-execute"; the CPU refuses to run code from a page without execute permission.
+      - **RWX**: memory that is readable, writable, and executable at once.
+      - **mmap**: the syscall a program uses to ask for new memory with chosen permissions.
+      - **Setuid**: a file permission that makes a program run with its owner's privileges.
+      - **Real / effective uid**: who started the process / whose permissions are checked.
+      - **setreuid**: syscall that sets the real and effective uid; `-1` leaves one unchanged.
+      - **execve**: syscall that replaces the current program with another, such as `/bin/sh`.
+      - **Saved return address**: the address a function's `ret` jumps to, stored on the stack.
+      - **ASLR**: the kernel places the stack (and more) at a random address each run.
+      - **Leak**: a program revealing a value, such as an address, that you were not meant to see.
+      - **ret2shellcode**: overwrite a return address so `ret` jumps into shellcode you placed.
+      - **Little-endian**: lowest byte stored first. `0x401021` in memory is `21 10 40 00 ...`.
+
+      ### Common mistakes
+      - **Forgetting `context.arch = "amd64"`.** pwntools then assembles for
+        32-bit x86, and the bytes are wrong for this machine.
+      - **Typing shellcode at the keyboard.** Your keystrokes become the code.
+        Write the bytes to a file, or send them from Python.
+      - **Sending text instead of bytes.** `"\x90"` in a shell `echo` or a
+        Python `str` is not the same as the byte `0x90`. In Python use `bytes`
+        (`b"..."`, `asm(...)`), and write files with `open(..., "wb")`.
+      - **Not checking for bad bytes.** Add an `assert` for each one before
+        sending.
+      - **Using a shellcraft template without reading it.** Print it first;
+        you are responsible for every byte.
+      - **Forgetting `setreuid` before a shell** in a setuid program. The shell
+        runs as you, and `cat /flag` says "Permission denied".
+      - **Reusing an address from an earlier run.** With ASLR, read the leak in
+        the same run that sends the payload.
+      - **Writing the address in the wrong byte order.** Use `p64(addr)`.
+      - **A long shellcode clobbering itself** with `push` (see the leak lesson).
+        Keep it short and at the start of the buffer.
+      - **Debugging by guessing.** Stop at the `syscall` in gdb and read
+        `rax`, `rdi`, `rsi`, `rdx`, or run the program under `strace`.
+
+      ### Where to go next
+      - [pwn.college: Shellcode Injection](https://pwn.college/) (free; the
+        intro dojos cover the same ideas in much more depth).
+      - [Linux x86-64 syscall table (Chromium OS docs)](https://chromium.googlesource.com/chromiumos/docs/+/master/constants/syscalls.md#x86_64-64_bit) lists every syscall number and its argument registers.
+      - `man 2 write`, `man 2 open`, `man 2 setreuid`, `man 2 execve`: the
+        manual pages for each syscall.
+      - The pwntools links in the next resource.
+
+  - name: Pwntools Shellcraft
+    type: markdown
+    content: |
+      - [pwnlib.shellcraft documentation](https://docs.pwntools.com/en/latest/shellcraft.html) — ready-made shellcode templates; assemble them with `asm()`.
+      - [pwnlib.asm documentation](https://docs.pwntools.com/en/latest/asm.html) — assemble and disassemble machine code from Python.
+      - [Shellcode in C (ired.team)](https://www.ired.team/offensive-security/code-injection-process-injection/writing-and-compiling-shellcode-in-c) — how raw shellcode is written and extracted from assembly.

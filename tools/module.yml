@@ -1,0 +1,603 @@
+name: Looking Inside Programs
+description: |
+  Use standard Linux tools to identify files, find text, inspect memory, trace
+  behavior, and read disassembly.
+challenges:
+  - id: inspector-strings
+    name: Find Strings
+  - id: inspector-mem
+    name: Inspect Memory
+  - id: inspector-fd
+    name: Inspect File Descriptors
+  - id: inspector-tree
+    name: Inspect a Process Tree
+  - id: objdump-disasm
+    name: Read Disassembly with objdump
+  - id: file-readout
+    name: Identify a Binary
+  - id: ltrace-trace
+    name: Trace Library Calls
+resources:
+  - name: "Start here: the tools in this module"
+    type: markdown
+    content: |
+      **Start here.** This module teaches you to look inside a program without
+      reading its source code. Every tool here is already on the machine, and you
+      will use them again in every later module. Reverse engineering starts with
+      questions: What kind of file is this? What text is in it? What does it do when
+      it runs? What does it ask the operating system for? Each tool answers one of
+      those questions.
+
+      The tools fall into two groups:
+
+      - **Static** tools look at the file on disk and never run it: `file`,
+        `readelf`, `strings`, `objdump`.
+      - **Dynamic** tools watch a program while it runs: `ps`, `pstree`, `lsof`,
+        `/proc`, `ltrace`, `strace`.
+
+      Use static tools first. They are safe, because nothing runs. Use dynamic tools
+      when the file alone does not answer your question.
+
+      **Suggested order:** `file-readout`, `inspector-strings`, `objdump-disasm`,
+      `ltrace-trace`, then `inspector-tree`, `inspector-fd`, `inspector-mem`.
+
+      The next four lessons share one small program, `toy`, that is not one of the
+      challenges. Every output you see was captured from a real run. Where a listing
+      is shortened, a line saying `...` marks the cut. Your own numbers (PIDs,
+      addresses) will be different. That is normal and expected.
+
+  - name: "The toy program, processes, PIDs, file descriptors and /proc"
+    type: markdown
+    content: |
+      **The toy program.** Here is `toy.c`. It opens a file, writes to it, prints a
+      message, compares a command-line argument with a word, and then waits 30
+      seconds so that we have time to inspect it.
+
+      ```c
+      #include <stdio.h>
+      #include <string.h>
+      #include <unistd.h>
+
+      int main(int argc, char **argv) {
+          const char *greeting = "hello from the toy program";
+          FILE *f = fopen("/tmp/toy-notes.txt", "w");
+          if (f == NULL) return 1;
+          fprintf(f, "notes\n");
+          printf("%s\n", greeting);
+          if (argc > 1 && strcmp(argv[1], "open-sesame") == 0)
+              puts("the word matched");
+          else
+              puts("the word did not match");
+          if (argc > 2) return 0;          /* second argument: skip the wait */
+          printf("pid %d, waiting 30 seconds\n", getpid());
+          fflush(stdout);
+          sleep(30);
+          fclose(f);
+          return 0;
+      }
+      ```
+
+      Compile it and run it:
+
+      ```
+      $ gcc -O0 -no-pie -fno-stack-protector -o toy toy.c
+      $ ./toy open-sesame
+      hello from the toy program
+      the word matched
+      pid 23, waiting 30 seconds
+      ```
+
+      (`-O0` turns off optimization so the machine code stays close to the C.
+      `-no-pie` makes the program load at a fixed address, which keeps addresses
+      easy to read. Later modules explain why that matters.)
+
+      You can compile the toy yourself in the challenge environment and follow along.
+
+      **What is a process?** A **program** is a file on disk. A **process** is that
+      program while it is running: the file's code loaded into memory, plus
+      everything the operating system tracks for it. You can run one program twice
+      and get two separate processes.
+
+      **What is a PID?** Linux gives every process a number, its **PID** (process
+      ID). Tools use the PID to say which process they mean. In the toy's output
+      above, `pid 23` is the number `getpid()` returned. Every process also records
+      the PID of the process that started it, its **PPID** (parent PID). When your
+      shell runs `./toy`, the shell is the **parent** and `toy` is the **child**.
+
+      **What is a file descriptor?** When a process opens a file, Linux does not
+      hand back the file. It hands back a small number, a **file descriptor** (fd).
+      The process uses that number in later calls ("write these bytes to fd 3"). A
+      new process starts with three already open:
+
+      ```
+      fd 0   standard input    where the program reads from  (normally your keyboard)
+      fd 1   standard output   where printf and puts write   (normally your screen)
+      fd 2   standard error    where error messages go
+      fd 3+  files the program opened itself
+      ```
+
+      The toy opened `/tmp/toy-notes.txt`, so it got the next free number, 3.
+
+      **What is a memory map?** A process sees memory as one long list of numbered
+      bytes. The number of a byte is its **address**, written in hex. The process
+      only owns some ranges of addresses. Each owned range is a **mapping**. A
+      mapping has a start, an end, and **permissions**: `r` (read), `w` (write),
+      `x` (execute, meaning the CPU may run it as code). The picture below shows the
+      usual layout (high addresses at the top):
+
+      ```
+      high addresses
+        [stack]            local variables, function return addresses    rw-
+        libc.so.6, ...     shared libraries (printf, puts, strcmp live here)
+                             their code is r-x, their data rw-
+        [heap]             memory from malloc                            rw-
+        program: .data     global variables that have a value            rw-
+        program: .rodata   constants and string literals                 r--
+        program: .text     the program's instructions                    r-x
+      low addresses
+      ```
+
+      Note what is not allowed: no mapping is both writable and executable in a
+      normal program. Later modules explain why that matters.
+
+      **What is `/proc`?** `/proc` looks like a folder, but it is not stored on the
+      disk. It is a window the kernel (the core of the operating system) provides
+      into itself. For every running process there is a folder `/proc/<pid>/`.
+      Reading a file in it asks the kernel a question and gets the answer as text.
+      The ones you need:
+
+      ```
+      /proc/<pid>/maps     the memory map
+      /proc/<pid>/fd/      one entry per open file descriptor
+      /proc/<pid>/exe      a link to the program file being run
+      /proc/<pid>/cmdline  the command line the process was started with
+      /proc/self/...       "my own process": whichever program reads it sees itself
+      ```
+
+      Because `/proc/self` means "whoever is reading", `cat /proc/self/maps` shows
+      the map of `cat`, not of your shell. To look at another process you must use
+      its real PID.
+
+  - name: "Watching a running process: ps, pstree, lsof, maps"
+    type: markdown
+    content: |
+      **Looking at a running process.** Start the toy in the background so you keep
+      your prompt. `&` at the end of a command does that, and `$!` holds the PID of
+      the last background command:
+
+      ```
+      $ ./toy open-sesame > run.txt &
+      $ pid=$!
+      ```
+
+      (The output goes to `run.txt` so it does not clutter your screen. That choice
+      will show up in the `fd` listing below.)
+
+      ### `ps` and `pstree`: who is running
+
+      ```
+      $ ps -o pid,ppid,cmd -p $pid
+          PID    PPID CMD
+           23       1 ./toy open-sesame
+      ```
+
+      Columns: `PID` is the process, `PPID` is its parent, `CMD` is the command line.
+      Here the parent is PID 1 because the toy was started from a script that was
+      itself PID 1 inside a container. In a normal terminal the PPID is your shell.
+
+      `ps -o pid,ppid,cmd --forest` lists every process and indents each child under
+      its parent. `pstree -p` draws the same tree with PIDs in parentheses:
+
+      ```
+      $ pstree -p
+      bash(1)-+-pstree(33)
+              `-toy(23)
+      ```
+
+      Read it left to right: `bash`, PID 1, has two children, `pstree` (the command
+      you just ran) and `toy`. When a challenge asks "who is the child of the
+      daemon", find the daemon's PID, then look for the line whose PPID equals it.
+
+      ### `/proc/<pid>/fd` and `lsof`: which files are open
+
+      ```
+      $ ls -l /proc/$pid/fd
+      lr-x------ ... 0 -> /dev/null
+      l-wx------ ... 1 -> /tmp/run.txt
+      l-wx------ ... 2 -> /tmp/run.txt
+      l-wx------ ... 3 -> /tmp/toy-notes.txt
+      ```
+
+      (Some columns are removed to fit.) Each name is a file descriptor number. Each
+      is a **symbolic link** (the `l` at the start; a link is a file that points at
+      another path, like a shortcut). The text after `->` is the file the descriptor
+      refers to. Reading the four lines:
+
+      - fd 0 points at `/dev/null`. In a terminal it would point at your terminal.
+      - fd 1 and fd 2 point at `/tmp/run.txt`, because we redirected output there.
+      - fd 3 points at `/tmp/toy-notes.txt`, the file the toy opened itself.
+
+      The permission letters after `l` show how it was opened: `r-x` means it was opened for reading, `-wx` for writing.
+      `readlink /proc/$pid/fd/3` prints only the target.
+
+      `lsof -p $pid` ("list open files") shows the same facts, plus more:
+
+      ```
+      $ lsof -p $pid
+      COMMAND PID USER   FD   TYPE DEVICE SIZE/OFF    NODE NAME
+      toy      23 root  cwd    DIR  0,120     4096 1850763 /tmp
+      toy      23 root  txt    REG  0,120    16312 1881351 /tmp/toy
+      toy      23 root  mem    REG   8,64          1734537 /usr/lib/x86_64-linux-gnu/libc.so.6
+      toy      23 root    0r   CHR    1,3      0t0       5 /dev/null
+      toy      23 root    1w   REG  0,120       71 1881680 /tmp/run.txt
+      toy      23 root    3w   REG  0,120        0 1881678 /tmp/toy-notes.txt
+      ```
+
+      (Shortened.) `FD` is either a number plus mode (`3w` means fd 3, open for
+      writing) or a word: `cwd` is the current directory, `txt` is the program file
+      itself, and `mem` is a file mapped into memory (here, the C library). `TYPE`
+      `REG` is a regular file, `DIR` a directory, `CHR` a device such as `/dev/null`.
+      `NAME` is the path.
+
+      ### `/proc/<pid>/maps`: where memory is
+
+      ```
+      $ cat /proc/$pid/maps
+      00400000-00401000 r--p 00000000 08:40 1881351   /tmp/toy
+      00401000-00402000 r-xp 00001000 08:40 1881351   /tmp/toy
+      00404000-00405000 rw-p 00003000 08:40 1881351   /tmp/toy
+      0d754000-0d775000 rw-p 00000000 00:00 0         [heap]
+      7377fd621000-7377fd624000 rw-p 00000000 00:00 0
+      7377fd64c000-7377fd7d4000 r-xp 00028000 08:40 1734537   /usr/lib/x86_64-linux-gnu/libc.so.6
+      7ffef7778000-7ffef7799000 rw-p 00000000 00:00 0 [stack]
+      ```
+
+      (Shortened to seven of 22 lines, and the spacing of the last column is
+      tightened.) Each line is `START-END PERMISSIONS OFFSET DEVICE INODE NAME`:
+
+      - `START-END`: the first address, and the address just past the last byte. The
+        size is `END - START`. Line 2 above is `0x402000 - 0x401000 = 0x1000`, which is
+        4096 bytes.
+      - `PERMISSIONS`: `r-xp` is readable, not writable, executable, and `p` for
+        private. `r-xp` is code. `rw-p` is data. `r--p` is read-only data.
+      - `OFFSET`: where in the named file this piece starts. Not important to you yet.
+      - `DEVICE`, `INODE`: which file on disk. `0` means no file.
+      - `NAME`: the file, or a special name like `[heap]` and `[stack]`. A line with
+        **no name and inode 0** is an **anonymous** mapping: plain memory not copied
+        from any file (the line with `7377fd621000` above).
+
+      Look at the layout: `/tmp/toy` is at a low address (`0x400000`), because we
+      compiled with `-no-pie`. The heap, the libraries and the stack are at other
+      addresses, and their exact numbers change on every run (that randomisation is
+      called ASLR, covered in a later module). `pmap -x $pid`
+      prints the same ranges with sizes already worked out.
+
+      When you are done, stop the toy with `kill $pid`.
+
+  - name: "Reading a file without running it: file, readelf, strings, objdump"
+    type: markdown
+    content: |
+      **Looking at a file without running it.** These four tools work on a file on
+      disk. Nothing in the file runs. Everything below is from `toy`.
+
+      ### `file`: what is this?
+
+      ```
+      $ file toy
+      toy: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked,
+      interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=c508...9a, for GNU/Linux
+      3.2.0, not stripped
+      ```
+
+      (Wrapped over several lines, and the BuildID is shortened.) `file` reads the
+      first bytes and names the format. Read it piece by piece:
+
+      - `ELF` is Linux's format for compiled programs. `64-bit` and `x86-64` give
+        the CPU family. `LSB` means the bytes of a number are stored least
+        significant byte first (**little endian**).
+      - `executable` is the kind of file. A shared library says `shared object`, and
+        a half-built `.o` file says `relocatable`.
+      - `dynamically linked` means it uses libraries (like the C library) that are
+        loaded when it starts. `interpreter ...` is the helper that loads them.
+      - `not stripped` means the function names are still inside the file. A
+        *stripped* file has them removed, which makes reading it harder.
+
+      ### `readelf -h`: the ELF header
+
+      ```
+      $ readelf -h toy
+      ELF Header:
+        Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
+        Class:                             ELF64
+        Data:                              2's complement, little endian
+        OS/ABI:                            UNIX - System V
+        Type:                              EXEC (Executable file)
+        Machine:                           Advanced Micro Devices X86-64
+        Entry point address:               0x401150
+        ...
+      ```
+
+      (Shortened.) The **header** is the table at the very start of the file.
+
+      - `Magic` starts with `7f 45 4c 46`, which is the byte `0x7f` followed by the
+        letters `E`, `L`, `F`. Every ELF file starts this way.
+      - `Type` is the line to look at first. `EXEC` is an executable. `DYN` is a
+        shared library, or a program built as position-independent code. `REL` is
+        an object file that cannot run yet.
+      - `Machine` is the CPU. A program built for another CPU will not run here.
+      - `Entry point address` is where the CPU starts running. For a C program that
+        is not `main` itself, but small setup code that calls `main`.
+
+      ### `strings`: the readable text in a file
+
+      ```
+      $ strings toy | head -n 30
+      /lib64/ld-linux-x86-64.so.2
+      sleep
+      puts
+      fflush
+      fopen
+      ...
+      strcmp
+      libc.so.6
+      ...
+      hello from the toy program
+      /tmp/toy-notes.txt
+      notes
+      open-sesame
+      the word matched
+      the word did not match
+      pid %d, waiting 30 seconds
+      ```
+
+      (Shortened.) `strings` prints every run of four or more printable characters.
+      Two kinds of text show up: **names of library functions** the program imports
+      (`sleep`, `puts`, `fopen`, `strcmp`), and **text the programmer typed**
+      (`hello from the toy program`, `open-sesame`). The functions list is already
+      a summary of what the program can do: it opens files and compares strings.
+      Any text typed literally in the source appears here. A secret that the program
+      *builds while running* does not, and that is why you need the dynamic tools
+      later. Use `strings toy | grep word` to filter, and `strings -n 8 toy` to ask
+      for longer runs only.
+
+      ### `objdump -d -M intel`: the instructions
+
+      `objdump -d` **disassembles** the file: it turns the machine code bytes back
+      into assembly. `-M intel` picks the Intel style. Here is the start of `main`
+      from `toy`:
+
+      ```
+      $ objdump -d -M intel toy
+      0000000000401236 <main>:
+        401236:  f3 0f 1e fa          endbr64
+        40123a:  55                   push   rbp
+        40123b:  48 89 e5             mov    rbp,rsp
+        40123e:  48 83 ec 20          sub    rsp,0x20
+        401242:  89 7d ec             mov    DWORD PTR [rbp-0x14],edi
+        401245:  48 89 75 e0          mov    QWORD PTR [rbp-0x20],rsi
+        401249:  48 8d 05 b4 0d 00 00 lea    rax,[rip+0xdb4]   # 402004
+        ...
+        401268:  e8 b3 fe ff ff       call   401120 <fopen@plt>
+        ...
+        4012ae:  83 7d ec 01          cmp    DWORD PTR [rbp-0x14],0x1
+        4012b2:  7e 32                jle    4012e6 <main+0xb0>
+        ...
+        4012cc:  e8 2f fe ff ff       call   401100 <strcmp@plt>
+        4012d1:  85 c0                test   eax,eax
+        4012d3:  75 11                jne    4012e6 <main+0xb0>
+      ```
+
+      (Shortened; real output has 68 lines for `main`, and the separator between
+      columns is a tab.) Each line has three columns:
+
+      1. **Address** (`401268:`) where the instruction sits in memory.
+      2. **Bytes** (`e8 b3 fe ff ff`) the machine code itself. Instructions are
+         between 1 and 15 bytes long.
+      3. **Instruction** (`call 401120 <fopen@plt>`): operation first, then
+         operands. In Intel style the **destination comes first**:
+         `mov rbp,rsp` copies `rsp` into `rbp`.
+
+      Things to notice:
+
+      - `<main>:` and `<fopen@plt>` are names. `@plt` marks a jump stub that leads
+        into a library function. A `call` to a `@plt` name is a **library call**.
+      - `cmp DWORD PTR [rbp-0x14],0x1` followed by `jle` is C's `if (argc > 1)`.
+        `cmp` compares and `jle` jumps if the result was "less than or equal". The
+        `0x1` is an **immediate**: a number written straight into the instruction.
+        Those numbers are often what you are hunting for.
+      - `test eax,eax` then `jne` is the check `== 0` on the result of `strcmp`.
+      - `[rbp-0x14]` means "the memory at the address `rbp` minus `0x14`": a local
+        variable on the stack. `DWORD PTR` says four bytes are read, and `QWORD PTR`
+        says eight.
+      - `lea rax,[rip+0xdb4]   # 402004` loads an address, here the address of the
+        text `hello from the toy program` (the comment after `#` is the computed
+        target). You can check it: `strings -t x toy` shows each text with its file
+        offset.
+
+      The assembly module goes through these instructions slowly. For now, practise finding `main`, finding `call` and
+      `cmp` lines, and reading the immediates.
+
+  - name: "Library calls vs system calls: ltrace and strace"
+    type: markdown
+    content: |
+      **Watching a program run: library calls and system calls.** A program asks for
+      help from two different places.
+
+      ```
+         your program (toy)
+              |
+              |  library call:  puts("hello"), strcmp(a, b), fopen(path, mode)
+              v
+         the C library (libc.so.6)    ordinary code that lives in a shared file
+              |
+              |  system call:   write(1, ...), openat(...), exit_group(0)
+              v
+         the kernel                   the only thing that can touch files,
+                                      the screen, the network, other processes
+      ```
+
+      - A **library call** is a call to a function in a shared library, such as
+        `strcmp` or `puts`. It is ordinary code running inside your process.
+      - A **system call** (syscall) is a request from the process to the kernel.
+        Only the kernel may open files, write to the screen, or start processes.
+        Library functions make system calls for you: `puts` ends up calling `write`.
+
+      Two tools show you each layer. `ltrace` prints library calls. `strace` prints
+      system calls. Both print one line per call, in the form
+      `name(arguments) = return value`.
+
+      ### `ltrace`
+
+      ```
+      $ ltrace ./toy open-sesame x
+      fopen("/tmp/toy-notes.txt", "w")                 = 0xf56a2a0
+      fwrite("notes\n", 1, 6, 0xf56a2a0)               = 6
+      puts("hello from the toy program")               = 27
+      strcmp("open-sesame", "open-sesame")             = 0
+      puts("the word matched")                         = 17
+      hello from the toy program
+      the word matched
+      +++ exited (status 0) +++
+      ```
+
+      (The extra `x` argument makes the toy skip its 30 second wait.) Reading it:
+
+      - `fopen("/tmp/toy-notes.txt", "w") = 0xf56a2a0`: the toy opened a file for
+        writing. The return value is a pointer (an address) to a record the library
+        keeps about that file.
+      - `strcmp("open-sesame", "open-sesame") = 0`: the arguments are the two
+        strings being compared. `strcmp` returns `0` when they are equal and a
+        non-zero number when they differ. **This is the most useful line in `ltrace`**:
+        when a program compares your input with a secret, both strings appear in
+        the trace.
+      - `puts(...) = 27`: `puts` returns a count, the 26 characters plus a newline.
+      - The toy's own output appears at the end, not in order. When output goes to
+        a file or a pipe, programs hold it back and write it at exit. In a terminal
+        it would be interleaved.
+
+      `ltrace -e strcmp ./toy ...` shows only `strcmp` calls. Note: a program
+      with special privileges (a **setuid** program, such as the `ltrace-trace`
+      challenge) runs without them when traced, so a traced run shows you the
+      comparison but cannot do the privileged part.
+
+      ### `strace`
+
+      ```
+      $ strace ./toy open-sesame x > /dev/null
+      execve("./toy", ["./toy", "open-sesame", "x"], 0x7ffee8413f60 /* 10 vars */) = 0
+      brk(NULL)                               = 0x95af000
+      openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+      read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832
+      mmap(NULL, 2170256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x752475d95000
+      close(3)                                = 0
+      ...
+      openat(AT_FDCWD, "/tmp/toy-notes.txt", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3
+      fstat(1, {st_mode=S_IFCHR|0666, st_rdev=makedev(0x1, 0x3), ...}) = 0
+      write(3, "notes\n", 6)                  = 6
+      write(1, "hello from the toy program\nthe w"..., 44) = 44
+      exit_group(0)                           = ?
+      +++ exited with 0 +++
+      ```
+
+      (Shortened from 40 lines; `strace` writes to stderr, which is why the program's
+      own output is sent to `/dev/null` here.) Reading it:
+
+      - `execve(...)`: the very first system call. The kernel starts our program.
+      - The lines from `openat` of `libc.so.6` to `mmap`: the loader opens the C
+        library, reads its header (the `\177ELF` is the magic bytes you met in
+        `readelf`), and maps it into memory. That is how the library lands in the
+        `maps` listing. The number after `=` for `openat` is the **file descriptor**
+        (3).
+      - `openat(..., "/tmp/toy-notes.txt", O_WRONLY|O_CREAT|O_TRUNC, ...) = 3` is the
+        system call under the library's `fopen`. The return value, 3, is the file
+        descriptor from the `fd` listing earlier. Then `write(3, "notes\n", 6)`
+        writes 6 bytes to it.
+      - `write(1, "hello ...", 44) = 44`: both `puts` calls became one `write` of 44
+        bytes to fd 1 (27 + 17 characters including newlines). A system call is
+        more expensive than a library call, so the library batches output.
+      - A return of `-1` with a name like `ENOENT` (seen in the full output for
+        `access("/etc/ld.so.preload", ...)`) means the call failed and says why.
+
+      **When to use which:** use `ltrace` to see *what the program thinks it is
+      doing* (which strings it compares, which functions it calls). Use `strace` to
+      see *what it asks the system to do* (which files it opens, where it writes).
+      If the file is statically linked or the binary is stripped of library calls,
+      `ltrace` shows little and `strace` still works.
+
+  - name: "Glossary, common mistakes, where to go next"
+    type: markdown
+    content: |
+      **Glossary, common mistakes, and where to go next.**
+
+      ### Glossary
+
+      - **Address**: the number of a byte in a process's memory. Written in hex.
+      - **Anonymous mapping**: memory not backed by a file. Shows as a `maps` line
+        with no name.
+      - **Argument**: a value passed to a program or a function.
+      - **Assembly**: the readable text form of machine instructions.
+      - **Daemon**: a program that keeps running in the background.
+      - **Disassembler**: a tool that turns machine code back into assembly.
+        `objdump -d` is one.
+      - **ELF**: the file format of Linux programs and libraries.
+      - **Environment variable**: a named value a program can read at start-up.
+        `NAME=value command` sets one for one command.
+      - **File descriptor (fd)**: a small number a process uses to refer to an open
+        file. 0, 1, 2 are standard input, output and error.
+      - **Header (ELF header)**: the table at the start of an ELF file describing
+        what kind of file it is.
+      - **Hex**: base 16 numbers. Digits `0-9` then `a-f`. `0x` in front marks it.
+      - **Immediate**: a number written directly inside an instruction.
+      - **Kernel**: the core of the operating system. Only it can touch hardware
+        and other processes.
+      - **Library**: a shared collection of functions. On Linux, `libc` provides
+        `printf`, `puts`, `strcmp` and more.
+      - **Library call**: a call to a library function. `ltrace` shows these.
+      - **Mapping**: a range of addresses a process owns, with permissions.
+      - **Parent / child**: the process that started another, and the one it started.
+      - **Permissions**: `r` read, `w` write, `x` execute, `p` private.
+      - **PID / PPID**: process ID, and the process ID of the parent.
+      - **Process**: a program while it is running.
+      - **`/proc`**: kernel-provided pseudo-folders that describe running processes.
+      - **Static / dynamic**: looking at a file on disk without running it, or
+        watching it while it runs.
+      - **Stripped**: an ELF file whose function names were removed.
+      - **Symbolic link**: a file that points at another path.
+      - **System call (syscall)**: a request from a process to the kernel.
+        `strace` shows these.
+
+      ### Common mistakes
+
+      1. **Looking at the wrong process.** `cat /proc/self/maps` and
+         `ls /proc/self/fd` describe the command you just typed. Use the PID of the
+         program you mean.
+      2. **Using an old PID.** Each restart gives a new PID and new addresses.
+         Re-read them every time. If `/proc/<pid>` says "No such file or directory",
+         the process has already exited.
+      3. **Expecting `strings` to find everything.** `strings` finds only text stored whole
+         in the file. Text a program builds at run time will not appear. Try
+         `ltrace` next.
+      4. **Copying part of a string.** `strings` lines can have leading or trailing
+         characters you must keep. Copy the whole line, and use single quotes in the
+         shell so special characters are passed unchanged.
+      5. **Reading the wrong `cmp`.** A function usually has several comparisons;
+         many only check that something worked. Follow the one that uses your
+         input.
+      6. **Mixing Intel and AT&T syntax.** Pass `-M intel`. Without it, `objdump`
+         writes the operands in the opposite order.
+      7. **Forgetting that `ps` shows itself too.** The listing includes the `ps`
+         (or `grep`) you just ran. Filter by the PPID or by the name.
+      8. **Trusting file names.** `file` and `readelf -h` read the *contents*. A
+         file called `program.exe` or `a.out` can be anything.
+      9. **Hex confusion.** `0x10` is 16 in decimal, not 10. Python can convert:
+         `python3 -c "print(0x10)"`.
+
+      ### Where to go next
+
+      - `man ltrace`, `man strace`, `man proc`, `man readelf`: the manual pages on the
+        machine. `man 5 proc` explains every file in `/proc`.
+      - The [pwn.college](https://pwn.college) introductory dojos are free and cover
+        the same ground with more depth.
+      - `strace` and `ltrace` are the quickest ways to learn what an unfamiliar
+        program does, so use them on programs you did not write, such as `ls`
+        or `cat`.
